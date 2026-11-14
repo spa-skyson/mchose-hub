@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import threading
 import time
+from dataclasses import replace
 
 from . import protocol
 from .transport import HidTransport
@@ -39,47 +40,84 @@ class HeadsetService:
         self._lock = threading.Lock()
 
     def _query(self, payload: bytes) -> bytes | None:
-        """Атомарная пара запись-чтение; payload без report-байта."""
+        """Сессия команда-ответ под блокировкой: unlock -> write -> read -> lock.
+
+        Каждая команда наушников обслуживается донглом только после
+        UNLOCK командного канала (PROTOCOL.md §7); LOCK выполняется и при
+        ошибке записи/чтения (finally). TransportError записи пробрасывается
+        как прежде — контракт типов возвратов не меняется.
+        """
         with self._lock:
-            self._transport.write_report(protocol.HEADSET_REPORT_ID, payload)
-            frame = self._transport.read_report(self._read_timeout_ms)
+            self._transport.unlock_command_channel()
+            try:
+                self._transport.write_report(protocol.HEADSET_REPORT_ID, payload)
+                frame = self._transport.read_report(self._read_timeout_ms)
+            finally:
+                self._transport.lock_command_channel()
         if frame is None:
             return None
         return _strip_report_id(frame, protocol.HEADSET_FRAME_SIZE)
 
-    def _drain(self) -> None:
-        """Короткое чтение: подтверждение не должно остаться в буфере."""
-        with self._lock:
-            self._transport.read_report(DRAIN_TIMEOUT_MS)
+    def _read_accept_locked(self) -> bool:
+        """Прочитать accept-подтверждение set-подкоманды внутри открытой сессии.
 
-    def poll_status(self) -> tuple[protocol.BatteryState, protocol.AudioMode] | None:
-        """Батарея и режим звука; None, если любой шаг не ответил."""
-        battery_frame = self._query(protocol.build_battery_query())
-        battery = (
-            protocol.parse_battery(battery_frame) if battery_frame is not None else None
+        True — устройство подтвердило команду (кадр с заголовком [0x55,0x22]);
+        False — ответа нет или кадр не распознан.
+        """
+        frame = self._transport.read_report(DRAIN_TIMEOUT_MS)
+        if frame is None:
+            return False
+        return (
+            protocol.parse_settings_response(
+                _strip_report_id(frame, protocol.HEADSET_FRAME_SIZE),
+                expect_value=False,
+            )
+            is not None
         )
-        if battery is None:
+
+    def poll_battery(self) -> protocol.BatteryState | None:
+        """Батарея; None, если донгл/наушники не ответили."""
+        frame = self._query(protocol.build_battery_query())
+        if frame is None:
             return None
-        mode_frame = self._query(protocol.build_audio_mode_query())
-        mode_raw = (
-            protocol.parse_audio_mode(mode_frame) if mode_frame is not None else None
-        )
+        return protocol.parse_battery(frame)
+
+    def poll_audio_mode(self) -> protocol.AudioMode | None:
+        """Режим звука; None, если ответа нет."""
+        frame = self._query(protocol.build_audio_mode_query())
+        if frame is None:
+            return None
+        mode_raw = protocol.parse_audio_mode(frame)
         if mode_raw is None:
             return None
-        return battery, protocol.AudioMode(mode_raw)
+        return protocol.AudioMode(mode_raw)
+
+    def poll_status(self) -> tuple[protocol.BatteryState, protocol.AudioMode] | None:
+        """Батарея и режим звука; кортеж только если ОБА ответа успешны."""
+        battery = self.poll_battery()
+        if battery is None:
+            return None
+        mode = self.poll_audio_mode()
+        if mode is None:
+            return None
+        return battery, mode
 
     def set_audio_mode(self, mode: protocol.AudioMode) -> protocol.AudioMode | None:
         """Установить режим и прочитать фактический; None без ответа."""
         with self._lock:
-            self._transport.write_report(
-                protocol.HEADSET_REPORT_ID, protocol.build_set_audio_mode(mode)
-            )
-            if self._settle_delay_s > 0:
-                time.sleep(self._settle_delay_s)
-            self._transport.write_report(
-                protocol.HEADSET_REPORT_ID, protocol.build_audio_mode_query()
-            )
-            frame = self._transport.read_report(self._read_timeout_ms)
+            self._transport.unlock_command_channel()
+            try:
+                self._transport.write_report(
+                    protocol.HEADSET_REPORT_ID, protocol.build_set_audio_mode(mode)
+                )
+                if self._settle_delay_s > 0:
+                    time.sleep(self._settle_delay_s)
+                self._transport.write_report(
+                    protocol.HEADSET_REPORT_ID, protocol.build_audio_mode_query()
+                )
+                frame = self._transport.read_report(self._read_timeout_ms)
+            finally:
+                self._transport.lock_command_channel()
         if frame is None:
             return None
         mode_raw = protocol.parse_audio_mode(
@@ -89,20 +127,31 @@ class HeadsetService:
             return None
         return protocol.AudioMode(mode_raw)
 
-    def set_auto_shutdown(self, minutes: int) -> None:
-        """Автоотключение: 15/30/45 минут, иначе ValueError."""
+    def set_auto_shutdown(self, minutes: int) -> bool:
+        """Автоотключение: 15/30/45 минут, иначе ValueError.
+
+        True — устройство подтвердило команду accept-кадром.
+        """
         value = protocol.AUTO_SHUTDOWN_MINUTES_TO_VALUE.get(minutes)
         if value is None:
             supported = ", ".join(
                 str(item) for item in sorted(protocol.AUTO_SHUTDOWN_MINUTES_TO_VALUE)
             )
             raise ValueError(f"автоотключение поддерживает только {supported} минут")
+        accepted = False
         with self._lock:
-            self._transport.write_report(
-                protocol.HEADSET_REPORT_ID,
-                protocol.build_settings(protocol.SETTINGS_SUB_SET_AUTO_SHUTDOWN, value),
-            )
-            self._transport.read_report(DRAIN_TIMEOUT_MS)
+            self._transport.unlock_command_channel()
+            try:
+                self._transport.write_report(
+                    protocol.HEADSET_REPORT_ID,
+                    protocol.build_settings(
+                        protocol.SETTINGS_SUB_SET_AUTO_SHUTDOWN, value
+                    ),
+                )
+                accepted = self._read_accept_locked()
+            finally:
+                self._transport.lock_command_channel()
+        return accepted
 
     def get_auto_shutdown(self) -> int | None:
         """Текущее автоотключение в минутах."""
@@ -116,18 +165,29 @@ class HeadsetService:
             return None
         return protocol.auto_shutdown_value_to_minutes(value)
 
-    def set_prompt_volume(self, level: int) -> None:
-        """Громкость голосовых подсказок, 0..15."""
+    def set_prompt_volume(self, level: int) -> bool:
+        """Громкость голосовых подсказок, 0..15.
+
+        True — устройство подтвердило команду accept-кадром.
+        """
         if not 0 <= level <= protocol.PROMPT_VOLUME_MAX:
             raise ValueError(
                 f"громкость подсказок принимает значение 0..{protocol.PROMPT_VOLUME_MAX}"
             )
+        accepted = False
         with self._lock:
-            self._transport.write_report(
-                protocol.HEADSET_REPORT_ID,
-                protocol.build_settings(protocol.SETTINGS_SUB_SET_PROMPT_VOLUME, level),
-            )
-            self._transport.read_report(DRAIN_TIMEOUT_MS)
+            self._transport.unlock_command_channel()
+            try:
+                self._transport.write_report(
+                    protocol.HEADSET_REPORT_ID,
+                    protocol.build_settings(
+                        protocol.SETTINGS_SUB_SET_PROMPT_VOLUME, level
+                    ),
+                )
+                accepted = self._read_accept_locked()
+            finally:
+                self._transport.lock_command_channel()
+        return accepted
 
     def get_prompt_volume(self) -> int | None:
         """Текущая громкость подсказок."""
@@ -138,13 +198,24 @@ class HeadsetService:
             return None
         return protocol.parse_settings_response(frame, expect_value=True)
 
-    def factory_reset(self) -> None:
-        """Сброс настроек наушников; ответ не ждётся."""
+    def factory_reset(self) -> bool:
+        """Сброс настроек наушников; accept-кадр потребляется внутри сессии.
+
+        True — устройство подтвердило сброс; False — подтверждения нет
+        (наушники не ответили или кадр не распознан).
+        """
+        accepted = False
         with self._lock:
-            self._transport.write_report(
-                protocol.HEADSET_REPORT_ID,
-                protocol.build_settings(protocol.SETTINGS_SUB_FACTORY_RESET),
-            )
+            self._transport.unlock_command_channel()
+            try:
+                self._transport.write_report(
+                    protocol.HEADSET_REPORT_ID,
+                    protocol.build_settings(protocol.SETTINGS_SUB_FACTORY_RESET),
+                )
+                accepted = self._read_accept_locked()
+            finally:
+                self._transport.lock_command_channel()
+        return accepted
 
 
 class DockService:
@@ -158,7 +229,9 @@ class DockService:
     ) -> None:
         self._transport = transport
         self._read_timeout_ms = read_timeout_ms
-        self._lock = threading.Lock()
+        # RLock: составные операции (set_direction) переиспользуют блокировку
+        # внутри, оставаясь атомарными для внешних вызовов.
+        self._lock = threading.RLock()
 
     def _exchange(self, frame: bytes, command_id: int) -> protocol.DockFrame | None:
         """Запрос-ответ; ответ обязан быть response-кадром той же команды."""
@@ -207,6 +280,21 @@ class DockService:
                 direction=lighting.direction,
             )
         )
+
+    def set_direction(self, direction: int) -> bool:
+        """Направление Flowing Wave: атомарный read-modify-write.
+
+        Отдельной команды direction нет: под одной блокировкой сервиса
+        читается свежий снимок и сразу пишется с новым направлением —
+        параллельная команда не вклинится между чтением и записью.
+        True — снимок прочитан и записан; False — устройство не ответило.
+        """
+        with self._lock:
+            info = self.read_global_info()
+            if info is None:
+                return False
+            self.set_global_info(replace(info, direction=direction))
+            return True
 
     def set_light_switch(self, enabled: bool) -> None:
         """Включить/выключить подсветку (cmd 33)."""
