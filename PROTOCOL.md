@@ -1,0 +1,109 @@
+# MCHOSE V9 Turbo+ — протокол управления (Linux)
+
+Спецификация восстановлена из официального ПО M HUB (Electron, web-bundle `cdn.mchose.com.cn/customPage/prod/assets/main-MopJAj_H.js`, секция `v9Turbo*`, beautified: `/tmp/opencode/mhub_web/main.pretty.js`, строки 55753–56630) и сверена с открытым проектом реверса V9 Pro (github.com/JoaoKSS/MCHOSE_v9_PRO_Controller, VID 0x291D/0x385D).
+
+## USB-идентификаторы (VID 14391 = 0x3837)
+
+| Устройство | VID:PID | Примечание |
+|---|---|---|
+| V9 Turbo+ донгл 2.4G | `3837:600a` | HID на интерфейсе MI_01 |
+| V9 Turbo+ док (RGB база) | `3837:6008` | HID, кадры дока |
+| V9 Turbo донгл | `3837:600d` | MI_01, «USB Gaming Headset» (INF VT008) |
+| V9 Pro / V9 / S9 Pro / G9 Pro донгл | `291d:385d` | профиль BLK, другой протокол |
+| V9 Pro 2 | `3837:6011` | профиль MC |
+| MagDock | `3837:1012` | — |
+
+Транспорт: hidraw. Пакеты — 63 байта данных (без reportId в буфере hidapi-raw; при HIDAPI write первый байт = reportId, дальше данные).
+
+## 1. Наушники (через донгл), reportId = 85 (0x55)
+
+Все «наушниковые» команды — output report `0x55 ...`, 63 байта.
+
+### Настройки (settings): `[0x55, 0x22, subId, value?]`
+Ответ: отчёт, начинающийся с `[0x55, 0x22, value]` (byte2 = значение; для set — accept).
+
+| subId | Действие |
+|---|---|
+| 0 | set auto-shutdown, value: 15 мин → 1, 30 мин → 4, 45 мин → 0 |
+| 1 | factory reset (без value) |
+| 2 | read auto-shutdown → value |
+| 3 | set voice-prompt volume, value 0–15 (дефолт 10) |
+| 4 | read voice-prompt volume → value |
+
+### Режим звука (audio mode)
+- query: `[0x55, 0x11]` (63 байта, паддинг 0) → ответ `[0x55, 0x11, mode]`
+- set: `[0x55, 0x21, 0x01, mode]` (15 байт длина кадра)
+- mode: `0` = Game 1, `1` = Game 2, `2` = Music
+- push-уведомление при переключении кнопкой на наушниках: отчёт reportId 0x55, data[0] = 0x11
+
+### Батарея
+- query: `[0x55, 0x65, 0x01]` → ответ `[0x55, 0x65, percent, status]`
+- status: `2` = разряд, `3` = зарядка, `4` = полный, `26` = спит (asleep)
+- push-уведомление: отчёт 0x55, data[0] = 101 (0x65)
+
+## 2. Док (RGB-база), reportId = 0 (данные без reportId, 63 байта)
+
+Кадр: `[0xAA, cmdId, msgType, seq, totalFrames, paramLen, params...]`
+- offset 0: START = 0xAA
+- offset 1: commandId
+- offset 2: msgType: 0 = request, 2 = response
+- offset 3: sequence, offset 4: totalFrames
+- offset 5: paramLen, offset 6..: params
+- OTA-пакеты (cmd 116): байт 62 = CRC8(params), poly 0x8C отражённый (CRC-8 Maxim/Dallas), init 0
+
+| cmdId | Команда | Параметры → Ответ |
+|---|---|---|
+| 1 | readLightSwitch | → params[0]==1 enabled |
+| 2 | readSleepInfo | → [enabled, time] |
+| 3 | readDeviceBaseInfo | → vid[2], pid[2], lightEnabled@5 |
+| 4 | readDeviceVersion | → low, middle, high |
+| 5 | readDeviceName | → строка |
+| 6 | readLightInfo | → [enabled, mode, modeCount, speed, brightness, lightSync, r, g, b] |
+| 7 | readGlobalInfo | → то же + sleepEnabled@9, sleepTime@10, version@12-13, direction@29 |
+| 8 | readLightColors | → RGB-триплеты |
+| 33 | setLightSwitch | [0/1] → accepted(params[0]==0) |
+| 34 | setSleepInfo | [enabled, time] |
+| 35 | setLightMode | [mode] |
+| 36 | setLightBrightness | [mode, brightness] |
+| 37 | setLightSpeed | [speed] |
+| 38 | setBaseColor | [r, g, b] |
+| 39 | setGlobalInfo | [enabled, mode, modeCount(5), speed, brightness, lightSync, r, g, b, direction] |
+| 40 | setLightSync | [0/1] |
+| 41 | setLightColors | RGB-пакеты: до 57 байт цветов на кадр, seq/totalFrames, при multi-кадре reportLength = len+6 |
+| 42 | resetDock | — |
+| 43 | enterUpdateMode | → accepted |
+| 116 | writeFirmwarePacket | seq, totalFrames=total-1, chunk ≤56 байт, CRC8 в байте 62 |
+| 117 | completeFirmware | — |
+
+## 3. Эффекты подсветки дока (mode IDs)
+Официальный M HUB: Constant On, Breathing, Cyclic Color Change, Starry Night, Flowing Wave, Music Rhythm (6 режимов, modeCount в кадре = 5 у setGlobalInfo по умолчанию — уточнить экспериментально 5 или 6). Индивидуальные цвета поддерживают режимы Constant/Breathing/Starry/MusicRhythm; Flowing Wave — направление (direction: 0/1 по/против часовой); Starry — скорость.
+
+## 4. EQ / 7.1 / микрофонные эффекты — НА ХОСТЕ, не в устройстве
+Профиль V9_TURBO в M HUB НЕ содержит eq-протокола. EQ (10 полос `eq_band_N_gain_db`), Xear Surround (room large/medium/small), voice morphing (Monster/Cartoon/Male/Female), AI noise reduction — host-side DSP: THX-сервис (gRPC, proto в `app/libs/THX/proto/`) + C-Media APO (`CmApoIce.dll`) в Windows-звуковом тракте, драйвер C-Media для PID_600A/600D (VT008/VT009).
+→ На Linux это воспроизводится через PipeWire filter-chain / EasyEffects (parametric EQ, compressor, reverb-adjacent FX), HID-слога устройства это не касается.
+
+## 5. Что реализуемо на Linux напрямую (HID-слой)
+Батарея + статус зарядки/сна, режимы звука Game1/Game2/Music (+мониторинг переключения кнопкой), автоотключение 15/30/45, громкость голосовых подсказок, factory reset, полный контроль RGB дока (режимы, скорость, яркость, цвета, светомузыка-режим, вкл/выкл, синхронизация), сон дока, информация (имена, версии прошивок дока и наушников, серийные данные).
+
+## Источники
+- Web-бандл M HUB: main-MopJAj_H.js (beautified копия: /tmp/opencode/mhub_web/main.pretty.js)
+- Установщик: /tmp/opencode/mhub/ (NSIS → Electron → app.asar распакован в app/resources/app_src)
+- Драйверы C-Media: app/libs/VT008 (PID_600D), VT009 (PID_600A)
+- THX proto: app/libs/THX/proto/thx_audio_properties.proto, thx_client_shell.proto
+
+## 6. Карта эффектов дока V9 Turbo+ (из UI M HUB, store magDock)
+
+| ID | Эффект | Управление |
+|---|---|---|
+| 0 | Constant On (static) | цвет, яркость |
+| 1 | Breathing | цвет, яркость, скорость |
+| 2 | Starry Night / Flash away (shiningBrightly) | цвет, яркость, скорость |
+| 3 | Cyclic Color Change (loop) | яркость, скорость; без кастомного цвета |
+| 4 | Flowing Wave (goFlow) | яркость, направление (0/1); без кастомного цвета |
+| 5 | Music Rhythm | цвет, яркость |
+
+- Скорость: UI-слайдер 1–5 инвертируется при отправке (`5 - value`) для всех эффектов, кроме Wave (отправка как есть = 1).
+- Направление: 0 = clockwise, 1 = anticlockwise (байт 29 в readGlobalInfo).
+- Палитра преднастроенных цветов в M HUB: 7 цветов [255,0,0],[255,160,0],[255,255,0],[0,255,0],[0,255,255],[0,0,255],[255,0,255].
+- modeCount устройство сообщает в readGlobalInfo (байт 2) — UI строит список эффектов динамически.
+- Неопределённые на 100% детали (проверить на живом устройстве): диапазон яркости (0–100 или 1–5), единицы sleepTime в readSleepInfo (минуты?).
