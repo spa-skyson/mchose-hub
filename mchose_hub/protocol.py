@@ -38,6 +38,23 @@ SETTINGS_SUB_READ_AUTO_SHUTDOWN = 2
 SETTINGS_SUB_SET_PROMPT_VOLUME = 3
 SETTINGS_SUB_READ_PROMPT_VOLUME = 4
 
+# --- Командный канал донгла: SET_FEATURE(Report 0xAA), PROTOCOL.md §7 ---
+# UNLOCK обязателен перед каждой командой наушников по interrupt OUT;
+# без него кадр уходит в буфер без ответа, далее ETIMEDOUT.
+FEATURE_AA_REPORT_ID = 0xAA
+FEATURE_AA_SIZE = 63
+
+
+def build_channel_open() -> bytes:
+    """UNLOCK канала: [0xAA, 0x01, 0x01] + нули, 63 байта данных."""
+    return bytes((FEATURE_AA_REPORT_ID, 0x01, 0x01)) + bytes(FEATURE_AA_SIZE - 3)
+
+
+def build_channel_close() -> bytes:
+    """LOCK канала: [0xAA, 0x01, 0x00] + нули, 63 байта данных."""
+    return bytes((FEATURE_AA_REPORT_ID, 0x01, 0x00)) + bytes(FEATURE_AA_SIZE - 3)
+
+
 AUTO_SHUTDOWN_MINUTES_TO_VALUE: dict[int, int] = {15: 1, 30: 4, 45: 0}
 PROMPT_VOLUME_MAX = 15
 PROMPT_VOLUME_DEFAULT = 10
@@ -218,14 +235,20 @@ def build_settings(sub_id: int, value: int | None = None) -> bytes:
 
 
 def parse_settings_response(data: bytes, expect_value: bool) -> int | None:
-    """Разбор ответа settings: матч начала [0x55, 0x22], значение в байте 2.
+    """Разбор ответа settings: матч начала [0x55, 0x22].
 
-    expect_value=True — ответ на read-подкоманду (значение обязательно);
-    expect_value=False — подтверждение set-команды (байт интерпретируется
-    как accept, но проверки значения не требуется).
+    expect_value=True — ответ на read-подкоманду (sub 2/4): значение в байте
+    после заголовка; усечённый кадр без значения -> None.
+    expect_value=False — ответ на set-подкоманду (sub 0/3): достаточно
+    совпадения заголовка [0x55, 0x22] -> возвращается 0 (accepted);
+    заголовка нет -> None.
     """
     idx = _match_headset(data, _SETTINGS_CMD)
-    if idx is None or len(data) <= idx:
+    if idx is None:
+        return None
+    if not expect_value:
+        return 0
+    if len(data) <= idx:
         return None
     return data[idx]
 

@@ -1,0 +1,14 @@
+[Desktop Entry]
+Type=Application
+Name=MCHOSE Hub
+Comment=Управление наушниками MCHOSE V9 Turbo+ и RGB-доком
+Icon=audio-headphones
+Terminal=false
+Categories=Utility;Settings;AudioVideo;
+Keywords=headset;mchose;
+# %PYTHONPATH% — placeholder рабочей директории проекта (где лежит пакет
+# mchose_hub). packaging/install.sh при установке подставляет реальный путь;
+# при ручной установке замените %PYTHONPATH% на путь к проекту, например:
+#   Path=/opt/mchose-hub
+Exec=python3 -m mchose_hub.gui
+Path=%PYTHONPATH%

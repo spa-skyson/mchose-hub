@@ -78,9 +78,26 @@ def test_settings_build_and_parse() -> None:
 
     response = bytes((0x55, 0x22, 4)) + bytes(60)
     assert proto.parse_settings_response(response, expect_value=True) == 4
-    assert proto.parse_settings_response(response, expect_value=False) == 4
+    assert proto.parse_settings_response(response, expect_value=False) == 0
     assert proto.parse_settings_response(bytes((0x55, 0x22)), expect_value=True) is None
+    assert proto.parse_settings_response(bytes((0x55, 0x22)), expect_value=False) == 0
     assert proto.parse_settings_response(bytes(8), expect_value=True) is None
+    assert proto.parse_settings_response(bytes(8), expect_value=False) is None
+    assert proto.parse_settings_response(bytes((0x66, 0x22, 4)), False) is None
+
+
+def test_channel_feature_frames() -> None:
+    """SET_FEATURE(0xAA): unlock/lock кадры по PROTOCOL.md §7."""
+    open_frame = proto.build_channel_open()
+    close_frame = proto.build_channel_close()
+    assert proto.FEATURE_AA_REPORT_ID == 0xAA
+    assert proto.FEATURE_AA_SIZE == 63
+    assert len(open_frame) == proto.FEATURE_AA_SIZE
+    assert len(close_frame) == proto.FEATURE_AA_SIZE
+    assert open_frame[:3] == b"\xaa\x01\x01"
+    assert close_frame[:3] == b"\xaa\x01\x00"
+    assert open_frame[3:] == bytes(proto.FEATURE_AA_SIZE - 3)
+    assert close_frame[3:] == bytes(proto.FEATURE_AA_SIZE - 3)
 
 
 def test_auto_shutdown_maps() -> None:

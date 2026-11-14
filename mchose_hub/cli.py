@@ -5,7 +5,6 @@ from __future__ import annotations
 import argparse
 import sys
 from collections.abc import Callable, Sequence
-from dataclasses import replace
 
 from .protocol import (
     AUDIO_MODE_NAMES,
@@ -85,20 +84,28 @@ def _cmd_status(_args: argparse.Namespace) -> int:
     dongle = find_dongle()
     if dongle is not None:
         try:
-            status = HeadsetService(dongle).poll_status()
+            service = HeadsetService(dongle)
+            battery = service.poll_battery()
+            mode = service.poll_audio_mode()
         finally:
             dongle.close()
-        if status is None:
+        if battery is None and mode is None:
             print(
                 "Донгл открыт, но наушники не ответили (выключены, спят "
                 "или вне радиуса).",
                 file=sys.stderr,
             )
         else:
-            battery, mode = status
-            print(f"Батарея: {battery.percent}% ({_battery_label(battery)})")
-            print(f"Режим звука: {AUDIO_MODE_NAMES[int(mode)]}")
-            exit_code = 0
+            if battery is None:
+                print("Батарею прочитать не удалось.", file=sys.stderr)
+            else:
+                print(f"Батарея: {battery.percent}% ({_battery_label(battery)})")
+                exit_code = 0
+            if mode is None:
+                print("Режим звука прочитать не удалось.", file=sys.stderr)
+            else:
+                print(f"Режим звука: {AUDIO_MODE_NAMES[int(mode)]}")
+                exit_code = 0
 
     dock = find_dock()
     if dock is not None:
@@ -142,10 +149,13 @@ def _cmd_shutdown(args: argparse.Namespace) -> int:
         return 1
     try:
         service = HeadsetService(dongle)
-        service.set_auto_shutdown(args.minutes)
+        accepted = service.set_auto_shutdown(args.minutes)
         current = service.get_auto_shutdown()
     finally:
         dongle.close()
+    if not accepted:
+        print("Устройство не подтвердило установку.", file=sys.stderr)
+        return 1
     if current is None:
         print("Установлено, но подтвердить чтением не удалось.", file=sys.stderr)
         return 1
@@ -160,10 +170,13 @@ def _cmd_prompt(args: argparse.Namespace) -> int:
         return 1
     try:
         service = HeadsetService(dongle)
-        service.set_prompt_volume(args.level)
+        accepted = service.set_prompt_volume(args.level)
         current = service.get_prompt_volume()
     finally:
         dongle.close()
+    if not accepted:
+        print("Устройство не подтвердило установку.", file=sys.stderr)
+        return 1
     if current is None:
         print("Установлено, но подтвердить чтением не удалось.", file=sys.stderr)
         return 1
@@ -238,14 +251,12 @@ def _cmd_light(args: argparse.Namespace) -> int:
                 print(f"Скорость эффекта: {args.value}")
                 return 0
             case "direction":
-                info = service.read_global_info()
-                if info is None:
-                    print(
-                        "Не удалось прочитать текущее состояние дока.", file=sys.stderr
-                    )
-                    return 1
+                # Атомарный read-modify-write внутри сервиса (одна блокировка):
+                # параллельная команда не вклинится между чтением и записью.
                 direction = 0 if args.value == "cw" else 1
-                service.set_global_info(replace(info, direction=direction))
+                if not service.set_direction(direction):
+                    print("Не удалось прочитать состояние дока.", file=sys.stderr)
+                    return 1
                 label = "по часовой" if direction == 0 else "против часовой"
                 print(f"Направление Flowing Wave: {label}")
                 return 0
@@ -288,7 +299,7 @@ def _build_parser() -> argparse.ArgumentParser:
     for axis in ("r", "g", "b"):
         light_color.add_argument(axis, type=_byte)
     light_brightness = light_sub.add_parser(
-        "brightness", help="яркость: режим и значение"
+        "brightness", help="яркость: режим и уровень 0–4 (>=5 устройство режет до 4)"
     )
     light_brightness.add_argument("mode", type=int)
     light_brightness.add_argument("value", type=_byte)
