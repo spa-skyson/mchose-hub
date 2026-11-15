@@ -80,8 +80,18 @@ def test_find_devices_absent(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) ->
 def test_find_dongle_unopenable(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """Узел обнаружен сканом, но открыть нельзя — TransportError с подсказкой.
+
+    os.open мокается: реальный /dev/hidrawN может появиться в системе в
+    любой момент, тест не должен зависеть от её состояния.
+    """
     monkeypatch.setattr(transport, "_HIDRAW_SYSFS", str(tmp_path / "hidraw"))
     _make_uevent(tmp_path, "hidraw9", "0003:00003837:0000600A")
+
+    def refuse(_path: str, _flags: int) -> int:
+        raise OSError(13, "Permission denied")
+
+    monkeypatch.setattr(transport.os, "open", refuse)
     with pytest.raises(transport.TransportError):
         transport.find_dongle()
 

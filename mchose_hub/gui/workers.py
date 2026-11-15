@@ -18,6 +18,7 @@ from typing import Any
 
 from PyQt6.QtCore import QObject, QThread, pyqtSignal
 
+from ..audio import AudioError
 from ..transport import TransportError
 
 # Бюджет ожидания воркеров при выходе: worst-case — две полные сессии
@@ -40,6 +41,9 @@ class ServiceWorker(QThread):
         try:
             outcome = self._job()
         except TransportError as exc:
+            if not self.stale:
+                self.failed.emit(exc.message, exc.hint)
+        except AudioError as exc:
             if not self.stale:
                 self.failed.emit(exc.message, exc.hint)
         except Exception as exc:  # noqa: BLE001 — наверх уходит текст ошибки

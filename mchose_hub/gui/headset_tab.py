@@ -18,7 +18,12 @@ from PyQt6.QtWidgets import (
 )
 
 from ..protocol import PROMPT_VOLUME_MAX, AudioMode, BatteryState
-from .helpers import battery_caption, battery_color, clamp_prompt_volume
+from .helpers import (
+    battery_caption,
+    battery_color,
+    clamp_prompt_volume,
+    with_transport_retry,
+)
 
 if TYPE_CHECKING:
     from .app import DeviceManager
@@ -211,7 +216,21 @@ class HeadsetTab(QWidget):
                 _mark_active(self._mode_buttons, int(actual))
             self._window.poll_now()
 
-        self._workers.run(job, on_success, device="headset")
+        # Отравленный транспорт/EOF: пере-скан + одноразовый ретрай команды.
+        self._workers.run(
+            with_transport_retry(
+                lambda: self._set_audio_mode_job(value),
+                self._window.recover_transport,
+            ),
+            on_success,
+            device="headset",
+        )
+
+    def _set_audio_mode_job(self, value: int) -> AudioMode | None:
+        with self._manager.command_session("headset") as service:
+            if service is None:
+                return None
+            return service.set_audio_mode(AudioMode(value))
 
     def request_shutdown(self, minutes: int) -> None:
         """Установка автоотключения + подтверждение чтением."""
@@ -232,7 +251,11 @@ class HeadsetTab(QWidget):
             self.apply_shutdown(minutes_actual)
             self._window.tray_update_shutdown(minutes_actual)
 
-        self._workers.run(job, on_success, device="headset")
+        self._workers.run(
+            with_transport_retry(job, self._window.recover_transport),
+            on_success,
+            device="headset",
+        )
 
     def reload_settings(self) -> None:
         """Перечитать автоотключение и громкость из устройства."""
@@ -285,7 +308,11 @@ class HeadsetTab(QWidget):
             else:
                 self.apply_volume(actual)
 
-        self._workers.run(job, on_success, device="headset")
+        self._workers.run(
+            with_transport_retry(job, self._window.recover_transport),
+            on_success,
+            device="headset",
+        )
 
     def _on_reset_clicked(self) -> None:
         if not self._confirm_reset():
@@ -308,7 +335,11 @@ class HeadsetTab(QWidget):
             self._window.poll_now()
             self.reload_settings()
 
-        self._workers.run(job, on_success, device="headset")
+        self._workers.run(
+            with_transport_retry(job, self._window.recover_transport),
+            on_success,
+            device="headset",
+        )
 
     def _confirm_reset(self) -> bool:
         first = QMessageBox.warning(

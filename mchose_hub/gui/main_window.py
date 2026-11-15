@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from typing import TYPE_CHECKING
 
 from PyQt6.QtCore import QSettings, QTimer
@@ -25,6 +26,8 @@ from ..transport import ETIMEDOUT_HEADSET_HINT, UDEV_HINT
 from .app import ManagerSnapshot
 from .dock_tab import DockTab
 from .headset_tab import HeadsetTab
+from .helpers import recovery_due, with_transport_retry
+from .sound_tab import SoundTab
 from .tray import MchoseTray
 from .workers import WorkerHost
 
@@ -36,6 +39,7 @@ if TYPE_CHECKING:
 _POLL_INTERVAL_MS = 15_000
 _WINDOW_TITLE = "MCHOSE Hub — V9 Turbo+"
 _TAB_HEADSET = "Наушники"
+_TAB_SOUND = "Звук"
 _TAB_DOCK = "Подсветка дока"
 _TAB_DEVICE = "Устройство"
 _ERROR_HINT_PREFIX = "Подсказка: "
@@ -81,6 +85,7 @@ class MainWindow(QMainWindow):
         self._tray: MchoseTray | None = None
         self._reconnect_generation = 0
         self._shutdown_done = False
+        self._last_recovery_discover: float | None = None
 
         self.setWindowTitle(_WINDOW_TITLE)
         self.resize(760, 560)
@@ -116,9 +121,11 @@ class MainWindow(QMainWindow):
 
         self.tabs = QTabWidget(root)
         self._headset_tab = HeadsetTab(self._manager, self._workers, self)
+        self._sound_tab = SoundTab(self._workers, self)
         self._dock_tab = DockTab(self._manager, self._workers, self)
         self._device_tab = self._build_device_tab(self.tabs)
         self.tabs.addTab(self._headset_tab, _TAB_HEADSET)
+        self.tabs.addTab(self._sound_tab, _TAB_SOUND)
         self.tabs.addTab(self._dock_tab, _TAB_DOCK)
         self.tabs.addTab(self._device_tab, _TAB_DEVICE)
         self.tabs.currentChanged.connect(self._on_tab_changed)
@@ -215,20 +222,14 @@ class MainWindow(QMainWindow):
 
         Таймер не останавливается: зависший воркер не паркует канал навсегда,
         следующий тик повторит попытку, а таймаут записи на транспорте делает
-        воркеры конечными.
+        воркеры конечными. Отравленный транспорт/EOF лечится на месте:
+        пере-скан и одноразовый ретрай (см. recover_transport).
         """
         if self._poll_active:
             return
         self._poll_active = True
         if not self._poll_timer.isActive():
             self._poll_timer.start()
-
-        def job() -> tuple[BatteryState | None, AudioMode | None]:
-            with self._manager.command_session("headset") as service:
-                if service is None:
-                    return None, None
-                # Раздельные запросы: батарея видна, даже если режим молчит.
-                return service.poll_battery(), service.poll_audio_mode()
 
         def on_success(
             result: tuple[BatteryState | None, AudioMode | None],
@@ -261,7 +262,33 @@ class MainWindow(QMainWindow):
             self._poll_active = False
             self.report_error(message, hint)
 
-        self._workers.run(job, on_success, on_failure, device="headset-poll")
+        self._workers.run(
+            with_transport_retry(self._poll_headset, self.recover_transport),
+            on_success,
+            on_failure,
+            device="headset-poll",
+        )
+
+    def _poll_headset(self) -> tuple[BatteryState | None, AudioMode | None]:
+        """Один проход опроса в свежей command_session (ретрай открывает новую)."""
+        with self._manager.command_session("headset") as service:
+            if service is None:
+                return None, None
+            # Раздельные запросы: батарея видна, даже если режим молчит.
+            return service.poll_battery(), service.poll_audio_mode()
+
+    def recover_transport(self) -> None:
+        """Пере-скан устройств для авто-восстановления (вызов из воркер-потоков).
+
+        Бюджет: не чаще одного discover() в секунду — иначе шторм NAK
+        устраивает цикл пересканирования. Вне бюджета пропуск: ретрай
+        повторит ошибку, восстановление случится на следующем тике.
+        """
+        now = time.monotonic()
+        if not recovery_due(self._last_recovery_discover, now):
+            return
+        self._last_recovery_discover = now
+        self._manager.discover()
 
     def shutdown(self) -> bool:
         """Единый путь остановки: таймер опроса, воркеры, менеджер. Идемпотентен.

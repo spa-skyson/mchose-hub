@@ -1,4 +1,4 @@
-"""CLI для отладки: python -m mchose_hub.cli {status,mode,shutdown,prompt,light}."""
+"""CLI для отладки: python -m mchose_hub.cli {status,mode,shutdown,prompt,light,eq,mic}."""
 
 from __future__ import annotations
 
@@ -6,6 +6,14 @@ import argparse
 import sys
 from collections.abc import Callable, Sequence
 
+from .audio import (
+    EQ_BANDS,
+    GAIN_MAX,
+    GAIN_MIN,
+    PRESETS,
+    AudioError,
+    PipeWireDSP,
+)
 from .protocol import (
     AUDIO_MODE_NAMES,
     LIGHT_MODE_NAMES,
@@ -266,6 +274,144 @@ def _cmd_light(args: argparse.Namespace) -> int:
         dock.close()
 
 
+def _cmd_eq(args: argparse.Namespace) -> int:
+    dsp = PipeWireDSP()
+    try:
+        match args.eq_command:
+            case "on":
+                gains = dsp.state.get("gains")
+                name = dsp.enable_eq(
+                    gains if isinstance(gains, list) else PRESETS["Flat"]
+                )
+                print(f"EQ включён: {name} (default переключён)")
+                return 0
+            case "off":
+                physical = dsp.disable_eq()
+                print(f"EQ выключен, default sink: {physical}")
+                return 0
+            case "preset":
+                name = args.name
+                if name not in PRESETS:
+                    print(
+                        f"Неизвестный пресет: {name}. Доступны: {', '.join(PRESETS)}",
+                        file=sys.stderr,
+                    )
+                    return 1
+                gains = PRESETS[name]
+                if dsp.eq_loaded():
+                    dsp.set_eq_gains(gains)
+                    print(f"Пресет применён: {name}")
+                else:
+                    dsp.enable_eq(gains)
+                    print(f"EQ включён с пресетом: {name}")
+                return 0
+            case "set":
+                band = args.band
+                if not 1 <= band <= len(EQ_BANDS):
+                    print(
+                        f"Полоса 1..{len(EQ_BANDS)}; {band} вне диапазона",
+                        file=sys.stderr,
+                    )
+                    return 1
+                current = dsp.state.get("gains")
+                gains = [
+                    float(g)
+                    for g in (current if isinstance(current, list) else PRESETS["Flat"])
+                ]
+                gains[band - 1] = args.gain
+                if dsp.eq_loaded():
+                    dsp.set_eq_gains(gains)
+                    print(
+                        f"Полоса {band} ({EQ_BANDS[band - 1][1]}): {args.gain:+.1f} дБ"
+                    )
+                else:
+                    dsp.enable_eq(gains)
+                    print(
+                        f"EQ включён; полоса {band} ({EQ_BANDS[band - 1][1]}): "
+                        f"{args.gain:+.1f} дБ"
+                    )
+                return 0
+            case "status":
+                _print_eq_status(dsp)
+                return 0
+            case _:
+                return 1
+    except AudioError as exc:
+        print(f"Ошибка: {exc.message}", file=sys.stderr)
+        if exc.hint:
+            print(f"Подсказка: {exc.hint}", file=sys.stderr)
+        return 1
+
+
+def _print_eq_status(dsp: PipeWireDSP) -> None:
+    sink = dsp.find_sink()
+    print(f"MCHOSE sink: {sink or 'не найден'}")
+    loaded = dsp.eq_loaded()
+    print(f"EQ: {'вкл' if loaded else 'выкл'}")
+    if loaded:
+        gains = dsp.state.get("gains")
+        if isinstance(gains, list) and len(gains) == len(EQ_BANDS):
+            for (freq, label), gain in zip(EQ_BANDS, gains):
+                print(f"  {label}: {float(gain):+.1f} дБ")
+    default = dsp._default_of("sink")
+    print(f"Default sink: {default or 'не определён'}")
+
+
+def _cmd_mic(args: argparse.Namespace) -> int:
+    dsp = PipeWireDSP()
+    try:
+        match args.mic_command:
+            case "volume":
+                percent = dsp.mic_volume(args.percent)
+                print(f"Громкость микрофона: {percent}%")
+                return 0
+            case "mute":
+                print(f"Микрофон заглушен: {dsp.mic_mute()}")
+                return 0
+            case "unmute":
+                print(f"Микрофон активен: {dsp.mic_unmute()}")
+                return 0
+            case "nr":
+                if args.nr_state == "on":
+                    name = dsp.enable_nr()
+                    print(f"Шумоподавление включено: {name}")
+                else:
+                    physical = dsp.disable_nr()
+                    print(f"Шумоподавление выключено, source: {physical}")
+                return 0
+            case "monitor":
+                if args.monitor_state == "on":
+                    route = dsp.monitoring_enable()
+                    print(f"Мониторинг включён: {route}")
+                else:
+                    print(dsp.monitoring_disable())
+                return 0
+            case "status":
+                _print_mic_status(dsp)
+                return 0
+            case _:
+                return 1
+    except AudioError as exc:
+        print(f"Ошибка: {exc.message}", file=sys.stderr)
+        if exc.hint:
+            print(f"Подсказка: {exc.hint}", file=sys.stderr)
+        return 1
+
+
+def _print_mic_status(dsp: PipeWireDSP) -> None:
+    source = dsp.find_source()
+    print(f"MCHOSE source: {source or 'не найден (микрофон не активен)'}")
+    print(
+        f"Шумоподавление: {'вкл' if dsp.nr_loaded() else 'выкл'} (RNNoise {'есть' if dsp.nr_supported() else 'нет'})"
+    )
+    print(f"Мониторинг: {'вкл' if dsp.monitoring_active() else 'выкл'}")
+    if source is not None:
+        node_id = dsp._node_id(source)
+        if node_id is not None:
+            result = dsp._run(["wpctl", "get-volume", str(node_id)])
+            print(f"Громкость: {result.stdout.strip()}")
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="mchose-hub",
@@ -309,6 +455,33 @@ def _build_parser() -> argparse.ArgumentParser:
     light_direction.add_argument("value", choices=["cw", "ccw"])
     light.set_defaults(func=_cmd_light)
 
+    eq = sub.add_parser("eq", help="эквалайзер (PipeWire filter-chain)")
+    eq_sub = eq.add_subparsers(dest="eq_command", required=True)
+    eq_sub.add_parser("on", help="включить EQ (виртуальный sink)")
+    eq_sub.add_parser("off", help="выключить EQ, вернуть default sink")
+    eq_preset = eq_sub.add_parser("preset", help="применить пресет")
+    eq_preset.add_argument("name", choices=sorted(PRESETS))
+    eq_set = eq_sub.add_parser("set", help="гейн полосы 1-10 (дБ)")
+    eq_set.add_argument("band", type=int, help="номер полосы 1-10 (31 Hz..16 kHz)")
+    eq_set.add_argument("gain", type=float, help=f"гейн {GAIN_MIN}..{GAIN_MAX} дБ")
+    eq_sub.add_parser("status", help="состояние EQ")
+    eq.set_defaults(func=_cmd_eq)
+
+    mic = sub.add_parser("mic", help="микрофон наушников (PipeWire)")
+    mic_sub = mic.add_subparsers(dest="mic_command", required=True)
+    mic_volume = mic_sub.add_parser(
+        "volume", help="громкость микрофона 0-100 (без арг. — текущая)"
+    )
+    mic_volume.add_argument("percent", nargs="?", type=int)
+    mic_sub.add_parser("mute", help="заглушить микрофон")
+    mic_sub.add_parser("unmute", help="включить микрофон")
+    mic_nr = mic_sub.add_parser("nr", help="шумоподавление RNNoise")
+    mic_nr.add_argument("nr_state", choices=["on", "off"])
+    mic_monitor = mic_sub.add_parser("monitor", help="мониторинг микрофона в наушники")
+    mic_monitor.add_argument("monitor_state", choices=["on", "off"])
+    mic_sub.add_parser("status", help="состояние микрофона")
+    mic.set_defaults(func=_cmd_mic)
+
     return parser
 
 
@@ -319,6 +492,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         return handler(args)
     except TransportError as exc:
+        print(f"Ошибка: {exc.message}", file=sys.stderr)
+        if exc.hint:
+            print(f"Подсказка: {exc.hint}", file=sys.stderr)
+        return 1
+    except AudioError as exc:
         print(f"Ошибка: {exc.message}", file=sys.stderr)
         if exc.hint:
             print(f"Подсказка: {exc.hint}", file=sys.stderr)
