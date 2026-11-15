@@ -193,8 +193,8 @@ RECOVERY_DISCOVER_INTERVAL_S = 1.0
 
 
 def is_recoverable_transport(message: str) -> bool:
-    """Транспорт отравлен или устройство отключилось (EOF) — лечится пере-сканом."""
-    return "отравлен" in message or "устройство отключено (EOF)" in message
+    """Транспорт отравлен или устройство отключилось (EOF/ENODEV) — лечится пере-сканом."""
+    return "отравлен" in message or "устройство отключено" in message
 
 
 def recovery_due(

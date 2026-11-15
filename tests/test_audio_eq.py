@@ -62,12 +62,53 @@ def test_sanitize_gains_wrong_length(count: int) -> None:
         sanitize_gains([0.0] * count)
 
 
+GENRE_PRESETS = [
+    "Rock",
+    "Pop",
+    "Jazz",
+    "Classical",
+    "Electronic",
+    "Hip-Hop",
+    "Acoustic",
+    "Speech",
+]
+
+
 def test_presets_shape() -> None:
-    """Пресеты: 5 штук, длина 10, значения в границах."""
-    assert list(PRESETS) == ["Flat", "Gaming", "Bass Boost", "Vocal", "Treble Boost"]
+    """Пресеты: 13 штук (5 исходных + 8 жанров), длина 10, значения в границах."""
+    assert list(PRESETS) == [
+        "Flat",
+        "Gaming",
+        "Bass Boost",
+        "Vocal",
+        "Treble Boost",
+        *GENRE_PRESETS,
+    ]
+    assert len(PRESETS) == 13
     for gains in PRESETS.values():
         assert len(gains) == 10
         assert all(GAIN_MIN <= g <= GAIN_MAX for g in gains)
+
+
+@pytest.mark.parametrize("name", GENRE_PRESETS)
+def test_genre_preset_shape(name: str) -> None:
+    """Каждый жанровый пресет: 10 полос в границах [-12, +12] дБ."""
+    gains = PRESETS[name]
+    assert len(gains) == 10
+    assert all(GAIN_MIN <= g <= GAIN_MAX for g in gains)
+
+
+def test_genre_preset_characteristic_values() -> None:
+    """Характерные кривые жанров по описанию."""
+    rock = PRESETS["Rock"]
+    assert rock[4:6] == [-2.0, -2.0]  # провал средних
+    assert rock[:2] == [4.0, 4.0] and rock[7:] == [3.0, 4.0, 4.0]  # V-образная
+    assert PRESETS["Electronic"][:3] == [7.0, 6.0, 4.0]  # мощный саб/бас
+    assert PRESETS["Hip-Hop"][0] == 8.0  # максимум баса
+    assert PRESETS["Speech"][:3] == [-6.0, -4.0, -1.0]  # срез гула
+    assert PRESETS["Speech"][4:8] == [4.0, 5.0, 4.0, 2.0]  # вокал вперёд
+    assert PRESETS["Acoustic"] == [3.0, 3.0, 2.0, 2.0, 1.0, 2.0, 3.0, 3.0, 2.0, 1.0]
+    assert PRESETS["Classical"][:7] == [0.0] * 7  # минимальная окраска
 
 
 def test_preset_values() -> None:

@@ -280,15 +280,18 @@ class PipeWireDSP:
     def load_state(self) -> dict[str, object]:
         """Состояние из ~/.config/mchose-hub/audio.json (или дефолт).
 
-        Любое нарушение схемы (битые гейны, не-bool флаги, чужие типы pid)
-        — файл целиком заменяется дефолтом: частично битый state хуже
-        потерянного.
+        Битый JSON и любое нарушение схемы (битые гейны, не-bool флаги,
+        чужие типы pid) — файл целиком заменяется дефолтом: частично битый
+        state хуже потерянного. Отсутствие файла — дефолт без перезаписи.
         """
         with self._state_lock:
             state = _default_state()
             try:
                 stored = json.loads(self.state_path.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
+            except OSError:
+                return state
+            except json.JSONDecodeError:
+                self._write_state(state)
                 return state
             if not isinstance(stored, dict) or not _state_is_valid(stored):
                 self._write_state(state)

@@ -54,6 +54,13 @@ ETIMEDOUT_HEADSET_HINT = (
     "затем передёрните донгл (выньте и вставьте) — приложение подхватит "
     "автоматически"
 )
+# ENODEV (Errno 19): узел hidraw пере-перечислился (донгл передёрнули,
+# udev пересоздал устройство) — старый fd мёртв, но устройство живо под
+# новым номером: лечится пере-сканом (gui.helpers.is_recoverable_transport).
+ENODEV_RESCAN_HINT = (
+    "устройство пере-перечислилось: приложение выполнит пере-скан hidraw "
+    "и подключится автоматически"
+)
 
 
 def hid_ioctl(*, get: bool, length: int) -> int:
@@ -68,6 +75,8 @@ def hid_ioctl(*, get: bool, length: int) -> int:
 
 
 def _error_hint(exc: OSError) -> str:
+    if exc.errno == errno.ENODEV:
+        return ENODEV_RESCAN_HINT
     return ETIMEDOUT_HEADSET_HINT if exc.errno == errno.ETIMEDOUT else ""
 
 
@@ -81,6 +90,22 @@ class TransportError(Exception):
 
     def __str__(self) -> str:
         return self.message
+
+
+def _transport_oserror(path: str, action: str, exc: OSError) -> TransportError:
+    """OSError → TransportError; ENODEV получает общий маркер отключения.
+
+    Errno 19 означает, что узел hidraw пере-перечислился: старый fd мёртв,
+    но устройство может жить под новым номером — лечится пере-сканом.
+    Сообщение «{path}: устройство отключено (переподключено)» содержит
+    префикс «устройство отключено», который матчит
+    is_recoverable_transport в gui.helpers (наряду с EOF).
+    """
+    if exc.errno == errno.ENODEV:
+        return TransportError(
+            f"{path}: устройство отключено (переподключено)", _error_hint(exc)
+        )
+    return TransportError(f"ошибка {action} {path}: {exc}", _error_hint(exc))
 
 
 class HidTransport(Protocol):
@@ -160,6 +185,14 @@ class HidrawTransport:
                 f"нет доступа на запись в {dev_path}", UDEV_HINT
             ) from exc
         except OSError as exc:
+            if exc.errno == errno.ENODEV:
+                # Узел исчез между сканом и open (пере-перечисление):
+                # тот же восстановимый маркер, что и на операциях fd —
+                # is_recoverable_transport запустит авто-пере-скан.
+                raise TransportError(
+                    f"{dev_path}: устройство отключено (переподключено)",
+                    ENODEV_RESCAN_HINT,
+                ) from exc
             raise TransportError(f"не удалось открыть {dev_path}: {exc}") from exc
 
     def _ensure_alive(self) -> None:
@@ -195,18 +228,17 @@ class HidrawTransport:
                     ETIMEDOUT_HEADSET_HINT,
                 ) from None
             if isinstance(outcome, Exception):
-                hint = _error_hint(outcome) if isinstance(outcome, OSError) else ""
-                raise TransportError(
-                    f"ошибка записи в {self.path}: {outcome}", hint
-                ) from outcome
+                if isinstance(outcome, OSError):
+                    raise _transport_oserror(
+                        self.path, "записи в", outcome
+                    ) from outcome
+                raise TransportError(f"ошибка записи в {self.path}: {outcome}")
             raise TransportError(
                 f"запись в {self.path} не подтверждена: данные могли дойти",
                 ETIMEDOUT_HEADSET_HINT,
             )
         except OSError as exc:
-            raise TransportError(
-                f"ошибка записи в {self.path}: {exc}", _error_hint(exc)
-            ) from exc
+            raise _transport_oserror(self.path, "записи в", exc) from exc
 
     def _await_write_outcome(self, future: Future[int]) -> int | Exception | None:
         """Дождаться исхода записи в пределах grace; None — не завершилась."""
@@ -261,7 +293,7 @@ class HidrawTransport:
             try:
                 ready, _, _ = select.select([self._fd], [], [], timeout_ms / 1000)
             except OSError as exc:
-                raise TransportError(f"ошибка ожидания {self.path}: {exc}") from exc
+                raise _transport_oserror(self.path, "ожидания", exc) from exc
             if not ready:
                 return None
             try:
@@ -269,7 +301,7 @@ class HidrawTransport:
             except BlockingIOError:
                 return None
             except OSError as exc:
-                raise TransportError(f"ошибка чтения {self.path}: {exc}") from exc
+                raise _transport_oserror(self.path, "чтения", exc) from exc
             if not chunk:
                 raise TransportError(f"{self.path}: устройство отключено (EOF)")
             return chunk
@@ -290,9 +322,8 @@ class HidrawTransport:
                     bytearray(buffer),
                 )
             except OSError as exc:
-                raise TransportError(
-                    f"ошибка SET_FEATURE(0x{report_id:02X}) в {self.path}: {exc}",
-                    _error_hint(exc),
+                raise _transport_oserror(
+                    self.path, f"SET_FEATURE(0x{report_id:02X}) в", exc
                 ) from exc
         return result if isinstance(result, int) else len(buffer)
 
@@ -307,9 +338,8 @@ class HidrawTransport:
                     self._fd, hid_ioctl(get=True, length=len(buf)), buf
                 )
             except OSError as exc:
-                raise TransportError(
-                    f"ошибка GET_FEATURE(0x{report_id:02X}) в {self.path}: {exc}",
-                    _error_hint(exc),
+                raise _transport_oserror(
+                    self.path, f"GET_FEATURE(0x{report_id:02X}) в", exc
                 ) from exc
         count = result if isinstance(result, int) else len(buf)
         return bytes(buf[: max(count, 0)])

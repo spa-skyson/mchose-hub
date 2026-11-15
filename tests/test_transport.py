@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import threading
 import time
 from concurrent.futures import Future
@@ -94,6 +95,37 @@ def test_find_dongle_unopenable(
     monkeypatch.setattr(transport.os, "open", refuse)
     with pytest.raises(transport.TransportError):
         transport.find_dongle()
+
+
+def test_open_enodev_is_recoverable(monkeypatch: pytest.MonkeyPatch) -> None:
+    """ENODEV при os.open (узел исчез между сканом и open) — восстановимый маркер.
+
+    Тот же маркер «устройство отключено», что и на операциях живого fd:
+    is_recoverable_transport отличит его и запустит авто-пере-скан.
+    """
+
+    def gone(_path: str, _flags: int) -> int:
+        raise OSError(errno.ENODEV, "No such device")
+
+    monkeypatch.setattr(transport.os, "open", gone)
+    with pytest.raises(transport.TransportError) as excinfo:
+        transport.HidrawTransport("/dev/hidraw0")
+    assert "устройство отключено" in excinfo.value.message
+    assert "переподключено" in excinfo.value.message
+    assert "пере-скан" in excinfo.value.hint
+
+
+def test_open_eio_keeps_plain_text(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Не-ENODEV OSError при open сохраняет точный текст без маркера отключения."""
+
+    def io_err(_path: str, _flags: int) -> int:
+        raise OSError(errno.EIO, "Input/output error")
+
+    monkeypatch.setattr(transport.os, "open", io_err)
+    with pytest.raises(transport.TransportError) as excinfo:
+        transport.HidrawTransport("/dev/hidraw0")
+    assert "не удалось открыть" in excinfo.value.message
+    assert "устройство отключено" not in excinfo.value.message
 
 
 def test_write_timeout_default_constant() -> None:
@@ -273,4 +305,120 @@ def test_read_report_eof_raises(monkeypatch: pytest.MonkeyPatch) -> None:
     with pytest.raises(transport.TransportError) as excinfo:
         device.read_report(10)
     assert "устройство отключено" in excinfo.value.message
+    device.close()
+
+
+def _enodev_device(monkeypatch: pytest.MonkeyPatch) -> transport.HidrawTransport:
+    """Транспорт с замоканным fd: os.open/close подставлены, узел «жив»."""
+    monkeypatch.setattr(transport.os, "open", lambda *args, **kwargs: 42)
+    monkeypatch.setattr(transport.os, "close", lambda fd: None)
+    return transport.HidrawTransport("/dev/null")
+
+
+def test_write_report_enodev_is_recoverable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ENODEV (Errno 19) на записи — «устройство отключено», hint про пере-скан.
+
+    Узел hidraw пере-перечислился: маркер в сообщении позволяет
+    is_recoverable_transport запустить авто-пере-скан (ретрай с новым fd).
+    """
+    device = _enodev_device(monkeypatch)
+
+    def gone(fd: int, data: bytes) -> int:
+        raise OSError(errno.ENODEV, "No such device")
+
+    monkeypatch.setattr(transport.os, "write", gone)
+    with pytest.raises(transport.TransportError) as excinfo:
+        device.write_report(0x55, b"\x01")
+    assert "устройство отключено" in excinfo.value.message
+    assert "переподключено" in excinfo.value.message
+    assert "пере-скан" in excinfo.value.hint
+    device.close()
+
+
+def test_write_late_enodev_is_recoverable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ENODEV, дошедший после бюджета записи (future-ветка) — тот же маркер."""
+    monkeypatch.setattr(transport.os, "open", lambda *args, **kwargs: 42)
+    monkeypatch.setattr(transport.os, "close", lambda fd: None)
+
+    def late_gone(fd: int, data: bytes) -> int:
+        time.sleep(0.2)  # дольше write_timeout_s, в пределах grace
+        raise OSError(errno.ENODEV, "No such device")
+
+    monkeypatch.setattr(transport.os, "write", late_gone)
+    device = transport.HidrawTransport(
+        "/dev/null", write_timeout_s=0.05, write_grace_s=1.0
+    )
+    with pytest.raises(transport.TransportError) as excinfo:
+        device.write_report(0x55, b"\x01")
+    assert "устройство отключено" in excinfo.value.message
+    assert "пере-скан" in excinfo.value.hint
+    device.close()
+
+
+def test_write_report_eio_keeps_plain_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Не-ENODEV OSError сохраняет точный текст «ошибка записи в …» без маркера."""
+    device = _enodev_device(monkeypatch)
+
+    def io_err(fd: int, data: bytes) -> int:
+        raise OSError(errno.EIO, "Input/output error")
+
+    monkeypatch.setattr(transport.os, "write", io_err)
+    with pytest.raises(transport.TransportError) as excinfo:
+        device.write_report(0x55, b"\x01")
+    assert "ошибка записи в" in excinfo.value.message
+    assert "устройство отключено" not in excinfo.value.message
+    device.close()
+
+
+@pytest.mark.parametrize("stage", ["select", "read"])
+def test_read_report_enodev_is_recoverable(
+    monkeypatch: pytest.MonkeyPatch, stage: str
+) -> None:
+    """ENODEV при ожидании или чтении — «устройство отключено», hint про пере-скан."""
+    device = _enodev_device(monkeypatch)
+    enodev = OSError(errno.ENODEV, "No such device")
+    if stage == "select":
+
+        def select_fail(*args: object) -> list[list[int]]:
+            raise enodev
+
+        monkeypatch.setattr(transport.select, "select", select_fail)
+    else:
+        monkeypatch.setattr(transport.select, "select", lambda *args: ([42], [], []))
+
+        def read_fail(fd: int, size: int) -> bytes:
+            raise enodev
+
+        monkeypatch.setattr(transport.os, "read", read_fail)
+    with pytest.raises(transport.TransportError) as excinfo:
+        device.read_report(10)
+    assert "устройство отключено" in excinfo.value.message
+    assert "пере-скан" in excinfo.value.hint
+    device.close()
+
+
+@pytest.mark.parametrize("mode", ["send", "get"])
+def test_feature_enodev_is_recoverable(
+    monkeypatch: pytest.MonkeyPatch, mode: str
+) -> None:
+    """ENODEV на feature-ioctl — «устройство отключено», hint про пере-скан."""
+    device = _enodev_device(monkeypatch)
+
+    def gone(fd: int, request: int, buf: bytearray) -> int:
+        raise OSError(errno.ENODEV, "No such device")
+
+    monkeypatch.setattr(transport.fcntl, "ioctl", gone)
+    with pytest.raises(transport.TransportError) as excinfo:
+        if mode == "send":
+            device.send_feature(0xAA, b"\x01\x01")
+        else:
+            device.get_feature(0xAA, 3)
+    assert "устройство отключено" in excinfo.value.message
+    assert "пере-скан" in excinfo.value.hint
     device.close()

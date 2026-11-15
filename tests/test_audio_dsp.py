@@ -780,6 +780,15 @@ def test_load_state_valid_file_passes_through(tmp_path: Any) -> None:
     assert dsp.state["gains"] == [3.5] * 10
 
 
+def test_load_state_broken_json_rewrites_file(tmp_path: Any) -> None:
+    """Синтаксически битый JSON → дефолт в памяти И перезаписан в файл."""
+    path = tmp_path / "audio.json"
+    path.write_text("{invalid json", encoding="utf-8")
+    dsp = PipeWireDSP(state_path=path)
+    assert dsp.state == _default_state()
+    assert json.loads(path.read_text(encoding="utf-8")) == _default_state()
+
+
 # ---------- MEDIUM-1: конкурентная запись audio.json ----------
 
 

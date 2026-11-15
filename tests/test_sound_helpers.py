@@ -108,6 +108,7 @@ def test_debounce_rearm_during_burst() -> None:
     [
         "/dev/hidraw12: транспорт отравлен незавершённой записью",
         "/dev/hidraw12: устройство отключено (EOF)",
+        "/dev/hidraw12: устройство отключено (переподключено)",
     ],
 )
 def test_is_recoverable_transport_true(message: str) -> None:
@@ -152,6 +153,26 @@ def test_with_transport_retry_recovers_and_retries() -> None:
         attempts += 1
         if attempts == 1:
             raise TransportError("транспорт отравлен незавершённой записью")
+        return "ok"
+
+    def recover() -> None:
+        nonlocal recoveries
+        recoveries += 1
+
+    assert with_transport_retry(job, recover)() == "ok"
+    assert (attempts, recoveries) == (2, 1)
+
+
+def test_with_transport_retry_recovers_enodev() -> None:
+    """ENODEV (пере-перечисление узла): recover вызван, команда повторена."""
+    attempts = 0
+    recoveries = 0
+
+    def job() -> str:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise TransportError("/dev/hidraw0: устройство отключено (переподключено)")
         return "ok"
 
     def recover() -> None:

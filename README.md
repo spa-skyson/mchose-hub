@@ -111,7 +111,7 @@ Example output (values depend on the connected devices):
   5 — Music Rhythm
 ```
 
-The CLI also supports `shutdown`, `prompt`, and `light on|off|mode|color|brightness|speed|direction`. EQ commands are `eq on|off|preset <name>|set <band> <gain>|status`; presets are `Flat`, `Gaming`, `Bass Boost`, `Vocal`, and `Treble Boost`. Microphone commands are `mic volume [0–100]`, `mute`, `unmute`, `nr on|off`, `monitor on|off`, and `status`. Run `python3 -m mchose_hub.cli <command> --help` or `python3 -m mchose_hub.cli <command> <subcommand> --help` for command-specific arguments.
+The CLI also supports `shutdown`, `prompt`, and `light on|off|mode|color|brightness|speed|direction`. EQ commands are `eq on|off|preset <name>|set <band> <gain>|status`; presets are `Flat`, `Gaming`, `Bass Boost`, `Vocal`, `Treble Boost`, plus the genre presets `Rock`, `Pop`, `Jazz`, `Classical`, `Electronic`, `Hip-Hop`, `Acoustic`, and `Speech`. Microphone commands are `mic volume [0–100]`, `mute`, `unmute`, `nr on|off`, `monitor on|off`, and `status`. Run `python3 -m mchose_hub.cli <command> --help` or `python3 -m mchose_hub.cli <command> <subcommand> --help` for command-specific arguments.
 
 ## Troubleshooting
 
@@ -153,7 +153,7 @@ python3 -m mchose_hub.gui
 
 Также можно установить правила и пункт меню командой `bash packaging/install.sh`.
 
-Хаб показывает батарею и версии прошивок, переключает режимы Game 1/Game 2/Music, автоотключение и громкость голосовых подсказок. Для дока доступны шесть эффектов подсветки, яркость, скорость, цвета, направление и светомузыка. В GUI есть вкладка «Звук»: 10-полосный EQ (31 Hz–16 kHz, ±12 дБ) с пресетами Flat, Gaming, Bass Boost, Vocal, Treble Boost и «Свои», RNNoise-шумоподавление микрофона, его громкость и mute, а также мониторинг в наушниках. EQ и DSP работают на хосте через PipeWire filter-chain; EQ доступен как виртуальный sink `effect_input.mchose_eq` и выводится на sink гарнитуры. CLI-примеры:
+Хаб показывает батарею и версии прошивок, переключает режимы Game 1/Game 2/Music, автоотключение и громкость голосовых подсказок. Для дока доступны шесть эффектов подсветки, яркость, скорость, цвета, направление и светомузыка. В GUI есть вкладка «Звук»: 10-полосный EQ (31 Hz–16 kHz, ±12 дБ) с пресетами Flat, Gaming, Bass Boost, Vocal, Treble Boost, жанрами Rock, Pop, Jazz, Classical, Electronic, Hip-Hop, Acoustic, Speech и «Свои», RNNoise-шумоподавление микрофона, его громкость и mute, а также мониторинг в наушниках. EQ и DSP работают на хосте через PipeWire filter-chain; EQ доступен как виртуальный sink `effect_input.mchose_eq` и выводится на sink гарнитуры. CLI-примеры:
 
 ```bash
 python3 -m mchose_hub.cli eq preset Gaming
