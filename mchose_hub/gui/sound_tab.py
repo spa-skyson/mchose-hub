@@ -292,6 +292,7 @@ class SoundTab(QWidget):
             apply_preset,
             lambda _r: self._window.note(f"Пресет применён: {name}"),
             self._window.report_error,
+            key="audio.eq",
         )
 
     def _on_debounce_tick(self) -> None:
@@ -302,6 +303,7 @@ class SoundTab(QWidget):
             lambda: self._dsp.set_eq_gains(gains),
             None,
             self._window.report_error,
+            key="audio.eq",
         )
 
     # --- EQ/NR/микрофон/мониторинг: тумблеры ---
@@ -326,6 +328,7 @@ class SoundTab(QWidget):
                     True, self._nr_check.isChecked(), self._monitor_check.isChecked()
                 ),
                 self._revert_check(self._eq_check),
+                key="audio.eq",
             )
         else:
             self._run_audio_job(
@@ -334,6 +337,7 @@ class SoundTab(QWidget):
                     False, self._nr_check.isChecked(), self._monitor_check.isChecked()
                 ),
                 self._revert_check(self._eq_check),
+                key="audio.eq",
             )
 
     def _on_nr_toggled(self, checked: bool) -> None:
@@ -344,6 +348,7 @@ class SoundTab(QWidget):
                     self._eq_check.isChecked(), True, self._monitor_check.isChecked()
                 ),
                 self._revert_check(self._nr_check),
+                key="audio.nr",
             )
         else:
             self._run_audio_job(
@@ -352,6 +357,7 @@ class SoundTab(QWidget):
                     self._eq_check.isChecked(), False, self._monitor_check.isChecked()
                 ),
                 self._revert_check(self._nr_check),
+                key="audio.nr",
             )
 
     def _on_monitor_toggled(self, checked: bool) -> None:
@@ -362,6 +368,7 @@ class SoundTab(QWidget):
                     self._eq_check.isChecked(), self._nr_check.isChecked(), True
                 ),
                 self._revert_check(self._monitor_check),
+                key="audio.monitor",
             )
         else:
             self._run_audio_job(
@@ -370,6 +377,7 @@ class SoundTab(QWidget):
                     self._eq_check.isChecked(), self._nr_check.isChecked(), False
                 ),
                 self._revert_check(self._monitor_check),
+                key="audio.monitor",
             )
 
     # --- микрофон: громкость и mute ---
@@ -387,6 +395,7 @@ class SoundTab(QWidget):
             lambda: self._dsp.mic_volume(percent),
             lambda actual: self._mic_value.setText(f"{actual}%"),
             self._window.report_error,
+            key="audio.mic",
         )
 
     def _on_mute_clicked(self) -> None:
@@ -396,7 +405,7 @@ class SoundTab(QWidget):
             self._mute_button.setText(_UNMUTE_BUTTON if muting else _MUTE_BUTTON)
 
         job = self._dsp.mic_mute if muting else self._dsp.mic_unmute
-        self._run_audio_job(job, on_success, self._window.report_error)
+        self._run_audio_job(job, on_success, self._window.report_error, key="audio.mic")
 
     # --- общее ---
 
@@ -405,6 +414,13 @@ class SoundTab(QWidget):
         job: Callable[[], _T],
         on_success: Callable[[_T], None] | None,
         on_failure: Callable[[str, str], None] | None,
+        *,
+        key: str = "audio",
     ) -> None:
-        """Аудио-джоб: только subprocess, без command_session; ключ device="audio"."""
-        self._workers.run(job, on_success, on_failure, device="audio")
+        """Аудио-джоб: только subprocess, без command_session.
+
+        key — device-ключ очереди воркеров: раздельные очереди не дают
+        зависшему EQ блокировать NR/микрофон/мониторинг; refresh-джобы
+        (без конкретного устройства) идут в общий ключ "audio".
+        """
+        self._workers.run(job, on_success, on_failure, device=key)

@@ -79,6 +79,35 @@ def test_repeated_run_replaces_pending(qapp: QApplication) -> None:
     host.shutdown()
 
 
+def test_distinct_device_keys_run_concurrently(qapp: QApplication) -> None:
+    """M4: разные device-ключи — независимые очереди, pending не замещается.
+
+    EQ-джоб занял ключ audio.eq; NR-джоб с ключом audio.nr стартует сразу
+    (а не падает в pending audio.eq и не вытесняет отложенный EQ).
+    """
+    from mchose_hub.gui.workers import WorkerHost
+
+    host = WorkerHost()
+    gate = threading.Event()
+    executed: list[str] = []
+    host.run(
+        lambda: "eq" if gate.wait(5.0) else "eq-timeout",
+        on_success=executed.append,
+        device="audio.eq",
+    )
+    assert (
+        host.run(
+            lambda: "nr",
+            on_success=executed.append,
+            device="audio.nr",
+        )
+        is not None
+    )  # другой ключ: поток создан, а не pending
+    gate.set()
+    _spin_until(qapp, lambda: executed == ["eq", "nr"])
+    host.shutdown()
+
+
 def test_shutdown_retry_phases(qapp: QApplication) -> None:
     """Три фазы выхода: таймаут → False, повтор до завершения → False, успех → True.
 

@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import json
 import subprocess
+import threading
 from typing import Any
 
 import pytest
 
 from mchose_hub.audio import AudioError, PipeWireDSP
-from mchose_hub.audio.dsp import NR_NODE_OUTPUT, RNNOISE_HINT
-from mchose_hub.audio.eq import EQ_NODE_INPUT
+from mchose_hub.audio.dsp import NR_NODE_OUTPUT, RNNOISE_HINT, _default_state
+from mchose_hub.audio.eq import EQ_NODE_INPUT, EQ_NODE_OUTPUT
 
 PHYSICAL_SINK = (
     "alsa_output.usb-C-Media_Electronics_Inc_MCHOSE_V9_Turbo__0123456789AB-01."
@@ -20,6 +21,50 @@ PHYSICAL_SOURCE = (
     "alsa_input.usb-C-Media_Electronics_Inc_MCHOSE_V9_Turbo__0123456789AB-01."
     "mono-fallback"
 )
+
+
+class FakeStdin:
+    """stdin холдера: close() = EOF = pw-cli завершается и снимает фильтр."""
+
+    def __init__(self, fake: FakeSubprocess, proc: FakeProcess) -> None:
+        self._fake = fake
+        self._proc = proc
+        self.closed = False
+
+    def close(self) -> None:
+        if self.closed:
+            return  # как файловый close: идемпотентен
+        self.closed = True
+        if not self._proc.stuck:
+            self._fake._process_exit(self._proc)
+
+
+class FakeProcess:
+    """Popen-двойник: жив, пока stdin открыт; stuck — игнорирует EOF (нужен kill)."""
+
+    def __init__(self, fake: FakeSubprocess, pid: int, *, stuck: bool = False) -> None:
+        self._fake = fake
+        self.pid = pid
+        self.stdin = FakeStdin(fake, self)
+        self.returncode: int | None = None
+        self.stuck = stuck
+        self.owned: list[str] = []  # имена нод, созданных этим холдером
+
+    def wait(self, timeout: float | None = None) -> int:
+        if self.returncode is not None:
+            return self.returncode
+        if self.stuck or not self.stdin.closed:
+            raise subprocess.TimeoutExpired("pw-cli", timeout)
+        self.returncode = 0
+        return 0
+
+    def kill(self) -> None:
+        self.stuck = False
+        self._fake._process_exit(self)
+        self.returncode = -9  # SIGKILL
+
+    def poll(self) -> int | None:
+        return self.returncode
 
 
 class FakeSubprocess:
@@ -34,13 +79,19 @@ class FakeSubprocess:
         self.default_source = "alsa_input.usb-046d_webcam.mono-fallback"
         self.calls: list[list[str]] = []
         self.holder_commands: list[str] = []
-        self.holder_pid: int | None = None
+        self.holders: list[FakeProcess] = []
+        self.next_holder_pid = 42424
         self.nodes: dict[str, int] = {PHYSICAL_SINK: 619, PHYSICAL_SOURCE: 620}
+        self.node_clients: dict[str, int] = {}  # имя ноды → pipeWire-id клиента
+        self.clients: dict[int, int] = {}  # id клиента → OS-pid владельца
+        self.next_client_id = 6001
         self.enum_gains: list[float] = [0.0] * 10
         self.volume: float = 0.50
         self.ldconfig = ldconfig
         self.apply_setparam = apply_setparam
         self.next_module_idx = 100
+        self.load_module_stdout: str | None = None
+        self.load_module_spawn = 1  # сколько модулей создаёт одна команда
 
     # --- точки подмены dsp ---
 
@@ -48,22 +99,45 @@ class FakeSubprocess:
         self.calls.append(list(cmd))
         return subprocess.CompletedProcess(cmd, 0, self._handle(cmd), "")
 
-    def spawn(self, command: str) -> int:
+    def spawn(self, command: str) -> FakeProcess:
+        """Холдер pw-cli: load-module создаёт фильтр-ноды, живёт до EOF/kill."""
         self.holder_commands.append(command)
-        self.holder_pid = 42424
-        for name in (EQ_NODE_INPUT, "effect_output.mchose_eq", NR_NODE_OUTPUT):
-            self.nodes[name] = 900 + len(self.nodes)
-        self.sinks.append(EQ_NODE_INPUT)
-        self.sources.append(NR_NODE_OUTPUT)
-        return self.holder_pid
+        proc = FakeProcess(self, self.next_holder_pid)
+        self.next_holder_pid += 1
+        self.holders.append(proc)
+        client_id = self.next_client_id
+        self.next_client_id += 2
+        # pw-cli-холдер держит два client-подключения: модульный (владелец
+        # нод) и главный REPL — уничтожаются вместе, иначе процесс живёт.
+        self.clients[client_id] = proc.pid  # модульный
+        self.clients[client_id + 1] = proc.pid  # главный
+        proc.owned = self._add_filter_nodes("nr" if "rnnoise" in command else "eq")
+        for name in proc.owned:
+            self.node_clients[name] = client_id
+        return proc
 
-    def kill(self) -> None:
-        self.holder_pid = None
-        self.sinks = [s for s in self.sinks if s != EQ_NODE_INPUT]
-        self.sources = [s for s in self.sources if s != NR_NODE_OUTPUT]
-        for name in (EQ_NODE_INPUT, "effect_output.mchose_eq"):
-            self.nodes.pop(name, None)
-        self.nodes.pop(NR_NODE_OUTPUT, None)
+    def _add_filter_nodes(self, kind: str) -> list[str]:
+        if kind == "nr":
+            names = [NR_NODE_OUTPUT]
+            self.nodes[NR_NODE_OUTPUT] = 900 + len(self.nodes)
+            self.sources.append(NR_NODE_OUTPUT)
+        else:
+            names = [EQ_NODE_INPUT, EQ_NODE_OUTPUT]
+            for name in names:
+                self.nodes[name] = 900 + len(self.nodes)
+            self.sinks.append(EQ_NODE_INPUT)
+        return names
+
+    def _process_exit(self, proc: FakeProcess) -> None:
+        """Холдер умер: только его filter-chain-ноды исчезают из графа."""
+        if proc in self.holders:
+            self.holders.remove(proc)
+        for name in proc.owned:
+            if name in self.nodes:
+                del self.nodes[name]
+            self.node_clients.pop(name, None)
+            self.sinks = [s for s in self.sinks if s != name]
+            self.sources = [s for s in self.sources if s != name]
 
     # --- имитация команд ---
 
@@ -83,10 +157,17 @@ class FakeSubprocess:
             case ["pactl", "move-sink-input", _index, _sink_name]:
                 return ""
             case ["pactl", "load-module", "module-loopback", *args]:
-                idx = self.next_module_idx
-                self.next_module_idx += 1
-                self.modules.append((idx, "module-loopback", " ".join(args)))
-                return f"New module index: {idx}\n"
+                created: list[int] = []
+                for _ in range(self.load_module_spawn):
+                    idx = self.next_module_idx
+                    self.next_module_idx += 1
+                    self.modules.append((idx, "module-loopback", " ".join(args)))
+                    created.append(idx)
+                if self.load_module_stdout is not None:
+                    return self.load_module_stdout
+                if created:
+                    return f"New module index: {created[0]}\n"
+                return ""
             case ["pactl", "unload-module", index]:
                 self.modules = [m for m in self.modules if m[0] != int(index)]
                 return ""
@@ -97,12 +178,27 @@ class FakeSubprocess:
                 self.default_source = name
                 return ""
             case ["pw-dump"]:
-                return json.dumps(
-                    [
-                        {"id": node_id, "info": {"props": {"node.name": name}}}
-                        for name, node_id in self.nodes.items()
-                    ]
-                )
+                entries: list[dict[str, Any]] = []
+                for name, node_id in self.nodes.items():
+                    props: dict[str, Any] = {"node.name": name}
+                    if name in self.node_clients:
+                        props["client.id"] = self.node_clients[name]
+                    entries.append(
+                        {
+                            "id": node_id,
+                            "type": "PipeWire:Interface:Node",
+                            "info": {"props": props},
+                        }
+                    )
+                for cid, pid in self.clients.items():
+                    entries.append(
+                        {
+                            "id": cid,
+                            "type": "PipeWire:Interface:Client",
+                            "info": {"props": {"application.process.id": pid}},
+                        }
+                    )
+                return json.dumps(entries)
             case ["wpctl", "set-default", node_id]:
                 name = self._name_by_id(int(node_id))
                 if name in self.sinks:
@@ -141,12 +237,6 @@ def _make_dsp(tmp_path: Any, fake: FakeSubprocess) -> PipeWireDSP:
     dsp = PipeWireDSP(state_path=tmp_path / "audio.json")
     dsp._run = fake.run  # type: ignore[method-assign]
     dsp._spawn_holder = fake.spawn  # type: ignore[method-assign]
-
-    def kill() -> None:
-        fake.kill()
-        dsp._set_state(holder_pid=None)
-
-    dsp._kill_holder = kill  # type: ignore[method-assign]
     return dsp
 
 
@@ -204,7 +294,7 @@ def test_enable_eq_loads_filter_chain_and_sets_default(tmp_path: Any) -> None:
         == PHYSICAL_SINK
     )
     assert dsp.state["eq_enabled"] is True
-    assert dsp.state["holder_pid"] == 42424
+    assert dsp.state["eq_holder_pid"] == 42424
 
 
 def test_enable_eq_moves_active_sink_inputs(tmp_path: Any) -> None:
@@ -398,3 +488,324 @@ def test_eq_loaded_reflects_sink_presence(tmp_path: Any) -> None:
     assert dsp.eq_loaded() is True
     dsp.disable_eq()
     assert dsp.eq_loaded() is False
+
+
+# ---------- M1: жизненный цикл холдера ----------
+
+
+def test_holder_alive_after_enable_dead_after_disable(tmp_path: Any) -> None:
+    """M1: enable держит живой Popen (stdin открыт), disable завершает его."""
+    fake = FakeSubprocess()
+    dsp = _make_dsp(tmp_path, fake)
+    dsp.enable_eq([0.0] * 10)
+    holder = dsp._eq_holder
+    assert holder is not None
+    assert holder.poll() is None
+    assert holder.stdin.closed is False
+    dsp.disable_eq()
+    assert dsp._eq_holder is None
+    assert holder.poll() is not None
+    assert holder.stdin.closed is True
+
+
+def test_holder_stuck_gets_sigkill_after_eof_timeout(tmp_path: Any) -> None:
+    """M1 kill-ветка: холдер игнорирует EOF → wait истекает → kill()."""
+    fake = FakeSubprocess()
+    dsp = _make_dsp(tmp_path, fake)
+    dsp.enable_eq([0.0] * 10)
+    holder = dsp._eq_holder
+    assert holder is not None
+    holder.stuck = True  # pw-cli «завис»: EOF не завершает
+    dsp.disable_eq()
+    assert holder.poll() == -9  # убит сигналом
+    assert EQ_NODE_INPUT not in fake.sinks  # ноды сняты
+
+
+# ---------- HIGH-1/HIGH-2: посмертный граф и неудачное снятие ----------
+
+
+def test_disable_eq_stale_graph_raises_and_leaves_all_alone(
+    tmp_path: Any, monkeypatch: Any
+) -> None:
+    """HIGH-1: фильтр прошлого сеанса — AudioError, ничьё не тронуто.
+
+    Никаких destroy/signals: чужой client с тем же/любым PID остаётся жив,
+    state не фиксирует «выключено».
+    """
+    import os
+
+    signals: list[tuple[int, int]] = []
+    monkeypatch.setattr(os, "kill", lambda pid, sig: signals.append((pid, sig)))
+    fake = FakeSubprocess()
+    dsp = _make_dsp(tmp_path, fake)
+    # Граф от «прошлого запуска»: ноды в графе, владелец — чужой процесс,
+    # живого холдера у dsp нет; в state лежит посторонний pid.
+    foreign = fake.spawn("load-module libpipewire-module-filter-chain stale")
+    dsp._eq_holder = None
+    dsp._set_state(eq_holder_pid=999999, eq_enabled=True)
+    clients_before = dict(fake.clients)
+
+    with pytest.raises(AudioError, match="прошлого сеанса") as excinfo:
+        dsp.disable_eq()
+
+    assert signals == []  # сигналов нет вовсе
+    assert "pw-cli (pid" not in excinfo.value.hint  # непроверенный PID не называется
+    assert "pw-dump" in excinfo.value.hint  # безопасная ручная инструкция на месте
+    assert fake.clients == clients_before  # чужие client-глобалы не тронуты
+    assert foreign.poll() is None  # чужой процесс жив
+    assert EQ_NODE_INPUT in fake.sinks  # граф не тронут
+    assert dsp.state["eq_enabled"] is True  # state не «выключен»
+    assert dsp.state["eq_holder_pid"] == 999999
+
+
+def test_disable_nr_stale_graph_raises_and_leaves_all_alone(tmp_path: Any) -> None:
+    """HIGH-1 (NR): посмертный граф — AudioError с ручной инструкцией, state цел."""
+    fake = FakeSubprocess(ldconfig="\tlibrnnoise_ladspa.so (libc)\n")
+    dsp = _make_dsp(tmp_path, fake)
+    foreign = fake.spawn("load-module libpipewire-module-filter-chain rnnoise stale")
+    dsp._nr_holder = None
+    dsp._set_state(nr_holder_pid=999999, nr_enabled=True)
+
+    with pytest.raises(AudioError, match="прошлого сеанса") as excinfo:
+        dsp.disable_nr()
+
+    assert "pw-cli (pid" not in excinfo.value.hint
+    assert "systemctl --user restart pipewire" in excinfo.value.hint
+    assert foreign.poll() is None
+    assert NR_NODE_OUTPUT in fake.sources
+    assert dsp.state["nr_enabled"] is True
+    assert dsp.state["nr_holder_pid"] == 999999
+
+
+def test_disable_eq_node_left_behind_raises(tmp_path: Any, monkeypatch: Any) -> None:
+    """HIGH-2: холдер убит, нода осталась в графе → AudioError, state цел.
+
+    Сервер «не убрал» ноды умершего клиента (фейк-процесс перестаёт снимать
+    ноды) — disable обязан НЕ писать enabled=False.
+    """
+    monkeypatch.setattr("mchose_hub.audio.dsp._SINK_POLL_TIMEOUT_S", 0.2)
+    fake = FakeSubprocess()
+    dsp = _make_dsp(tmp_path, fake)
+    dsp.enable_eq([0.0] * 10)
+    holder_pid = dsp._eq_holder.pid if dsp._eq_holder else None
+    fake._process_exit = lambda proc: None  # имитация: ноды не исчезли
+
+    with pytest.raises(AudioError, match="не снят"):
+        dsp.disable_eq()
+
+    assert dsp._eq_holder is None  # холдер остановлен
+    assert EQ_NODE_INPUT in fake.sinks  # нода осталась
+    assert dsp.state["eq_enabled"] is True  # «выключено» не зафиксировано
+    assert dsp.state["eq_holder_pid"] == holder_pid
+
+
+def test_disable_nr_node_left_behind_raises(tmp_path: Any, monkeypatch: Any) -> None:
+    """HIGH-2 (NR): нода не исчезла после остановки холдера → AudioError."""
+    monkeypatch.setattr("mchose_hub.audio.dsp._SINK_POLL_TIMEOUT_S", 0.2)
+    fake = FakeSubprocess(ldconfig="\tlibrnnoise_ladspa.so (libc)\n")
+    dsp = _make_dsp(tmp_path, fake)
+    dsp.enable_nr()
+    holder_pid = dsp._nr_holder.pid if dsp._nr_holder else None
+    fake._process_exit = lambda proc: None  # ноды «залипли» в графе
+
+    with pytest.raises(AudioError, match="не снят"):
+        dsp.disable_nr()
+
+    assert dsp.state["nr_enabled"] is True
+    assert dsp.state["nr_holder_pid"] == holder_pid
+
+
+def test_enable_eq_over_stale_graph_raises_without_spawning(tmp_path: Any) -> None:
+    """HIGH-1: включение поверх посмертного графа — AudioError, холдер не создан."""
+    fake = FakeSubprocess()
+    dsp = _make_dsp(tmp_path, fake)
+    fake.spawn("load-module libpipewire-module-filter-chain stale")
+    dsp._eq_holder = None
+    spawns_before = len(fake.holder_commands)
+
+    with pytest.raises(AudioError, match="прошлого сеанса"):
+        dsp.enable_eq([0.0] * 10)
+
+    assert len(fake.holder_commands) == spawns_before  # холдер поверх сироты не запущен
+
+
+def test_monitoring_failure_spares_all_modules(tmp_path: Any) -> None:
+    """MEDIUM-2 финал: при сбое парсинга не выгружается НИЧЬИ модули."""
+    fake = FakeSubprocess()
+    fake.modules.append((500, "module-loopback", "source=other.source sink=other.sink"))
+    fake.load_module_stdout = "неожиданный вывод pactl\n"
+    dsp = _make_dsp(tmp_path, fake)
+    with pytest.raises(AudioError, match="не удалось разобрать индекс модуля"):
+        dsp.monitoring_enable()
+    assert [m[0] for m in fake.modules] == [500, 100]  # чужой и наш живы
+    assert not [c for c in fake.calls if c[:2] == ["pactl", "unload-module"]]
+    assert dsp.state["monitor_enabled"] is False
+
+
+def test_write_state_leaves_no_tmp_file(tmp_path: Any) -> None:
+    """MEDIUM-1: атомарная запись не оставляет .tmp-мусор рядом с audio.json."""
+    dsp = _make_dsp(tmp_path, FakeSubprocess())
+    dsp._set_state(eq_enabled=True)
+    state_dir = tmp_path
+    assert (state_dir / "audio.json").exists()
+    assert list(state_dir.glob("*.tmp")) == []
+
+
+def test_stale_filter_hint_without_pid(tmp_path: Any) -> None:
+    """HIGH-1: подсказка никогда не называет непроверенный PID."""
+    dsp = _make_dsp(tmp_path, FakeSubprocess())
+    hint = dsp._stale_filter_hint()
+    assert "systemctl --user restart pipewire" in hint
+    assert "pw-dump" in hint
+    assert "pw-cli (pid" not in hint
+
+
+# ---------- M3: раздельные холдеры EQ и NR ----------
+
+
+def test_disable_eq_leaves_nr_holder_alive(tmp_path: Any) -> None:
+    """M3: enable_eq → enable_nr → disable_eq: NR-холдер жив, снят только EQ."""
+    fake = FakeSubprocess(ldconfig="\tlibrnnoise_ladspa.so (libc)\n")
+    dsp = _make_dsp(tmp_path, fake)
+    dsp.enable_eq([0.0] * 10)
+    dsp.enable_nr()
+    eq_holder = dsp._eq_holder
+    nr_holder = dsp._nr_holder
+    assert eq_holder is not None and nr_holder is not None
+    assert eq_holder is not nr_holder
+    dsp.disable_eq()
+    assert nr_holder.poll() is None  # NR жив
+    assert nr_holder.stdin.closed is False
+    assert eq_holder.poll() is not None
+    assert NR_NODE_OUTPUT in fake.sources  # NR-нода в графе
+    assert dsp.state["nr_enabled"] is True
+    assert dsp.state["eq_enabled"] is False
+
+
+def test_disable_nr_leaves_eq_holder_alive(tmp_path: Any) -> None:
+    """M3 (обратный порядок): enable_nr → enable_eq → disable_nr: EQ жив."""
+    fake = FakeSubprocess(ldconfig="\tlibrnnoise_ladspa.so (libc)\n")
+    dsp = _make_dsp(tmp_path, fake)
+    dsp.enable_nr()
+    dsp.enable_eq([0.0] * 10)
+    eq_holder = dsp._eq_holder
+    nr_holder = dsp._nr_holder
+    assert eq_holder is not None and nr_holder is not None
+    dsp.disable_nr()
+    assert eq_holder.poll() is None  # EQ жив
+    assert eq_holder.stdin.closed is False
+    assert nr_holder.poll() is not None
+    assert EQ_NODE_INPUT in fake.sinks  # EQ-нода в графе
+    assert dsp.state["eq_enabled"] is True
+    assert dsp.state["nr_enabled"] is False
+
+
+# ---------- MI1: мониторинг без индекса модуля ----------
+
+
+def test_monitoring_enable_unexpected_stdout_raises(tmp_path: Any) -> None:
+    """MEDIUM-2 финал: сбой парсинга → AudioError с ручной инструкцией."""
+    fake = FakeSubprocess()
+    fake.load_module_stdout = "неожиданный вывод pactl\n"
+    dsp = _make_dsp(tmp_path, fake)
+    with pytest.raises(AudioError, match="не удалось разобрать индекс модуля") as exc:
+        dsp.monitoring_enable()
+    assert "pactl unload-module" in exc.value.message  # ручная инструкция
+    assert "systemctl --user restart pipewire" in exc.value.message
+    assert not [c for c in fake.calls if c[:2] == ["pactl", "unload-module"]]
+    assert dsp.state["monitor_enabled"] is False
+    assert dsp.state["monitor_module_idx"] is None
+
+
+def test_monitoring_enable_no_unload_when_module_not_created(tmp_path: Any) -> None:
+    """MEDIUM-2: модуль не создался (ноль новых) — всё равно без unload."""
+    fake = FakeSubprocess()
+    fake.load_module_spawn = 0
+    fake.load_module_stdout = "неожиданный вывод pactl\n"
+    dsp = _make_dsp(tmp_path, fake)
+    with pytest.raises(AudioError, match="не удалось разобрать индекс модуля"):
+        dsp.monitoring_enable()
+    assert not [c for c in fake.calls if c[:2] == ["pactl", "unload-module"]]
+    assert fake.modules == []
+    assert dsp.state["monitor_enabled"] is False
+
+
+def test_monitoring_enable_no_unload_when_multiple_created(tmp_path: Any) -> None:
+    """MEDIUM-2: несколько новых модулей — без выгрузки (чужие не трогаем)."""
+    fake = FakeSubprocess()
+    fake.load_module_spawn = 2
+    fake.load_module_stdout = "неожиданный вывод pactl\n"
+    dsp = _make_dsp(tmp_path, fake)
+    with pytest.raises(AudioError, match="не удалось разобрать индекс модуля"):
+        dsp.monitoring_enable()
+    assert [m[0] for m in fake.modules] == [100, 101]  # оба остались на месте
+    assert not [c for c in fake.calls if c[:2] == ["pactl", "unload-module"]]
+    assert dsp.state["monitor_enabled"] is False
+
+
+# ---------- MI2: битый audio.json ----------
+
+
+@pytest.mark.parametrize(
+    ("overrides", "broken_key"),
+    [
+        ({"gains": ["a"] * 10}, "gains-строки"),
+        ({"gains": [0.0] * 9}, "gains-длина"),
+        ({"gains": [13.0] * 10}, "gains-диапазон"),
+        ({"gains": [True, 0, 0, 0, 0, 0, 0, 0, 0, 0]}, "gains-bool"),
+        ({"eq_enabled": "yes"}, "флаг-строка"),
+        ({"eq_holder_pid": "4242"}, "pid-строка"),
+        ({"nr_holder_pid": True}, "pid-bool"),
+    ],
+)
+def test_load_state_corrupt_resets_and_rewrites(
+    tmp_path: Any, overrides: dict[str, object], broken_key: str
+) -> None:
+    """MI2: любое нарушение схемы → дефолт в памяти и в перезаписанном файле."""
+    stored = {**_default_state(), **overrides}
+    path = tmp_path / "audio.json"
+    path.write_text(json.dumps(stored), encoding="utf-8")
+    dsp = PipeWireDSP(state_path=path)
+    assert dsp.state == _default_state(), broken_key
+    assert json.loads(path.read_text(encoding="utf-8")) == _default_state()
+
+
+def test_load_state_valid_file_passes_through(tmp_path: Any) -> None:
+    """MI2: валидный файл читается как есть (дефолтная перезапись не нужна)."""
+    stored = {**_default_state(), "eq_enabled": True, "gains": [3.5] * 10}
+    path = tmp_path / "audio.json"
+    path.write_text(json.dumps(stored), encoding="utf-8")
+    dsp = PipeWireDSP(state_path=path)
+    assert dsp.state["eq_enabled"] is True
+    assert dsp.state["gains"] == [3.5] * 10
+
+
+# ---------- MEDIUM-1: конкурентная запись audio.json ----------
+
+
+def test_concurrent_eq_nr_keep_state_file_valid(tmp_path: Any) -> None:
+    """MEDIUM-1: конкурентные enable_eq + enable_nr — файл всегда валиден.
+
+    Два воркера (audio.eq / audio.nr) пишут один audio.json: RLock
+    сериализует read-modify-write, os.replace делает запись атомарной.
+    20 итераций на свежем state-файле.
+    """
+    for i in range(20):
+        fake = FakeSubprocess(ldconfig="\tlibrnnoise_ladspa.so (libc)\n")
+        dsp = PipeWireDSP(state_path=tmp_path / str(i) / "audio.json")
+        dsp._run = fake.run  # type: ignore[method-assign]
+        dsp._spawn_holder = fake.spawn  # type: ignore[method-assign]
+        threads = [
+            threading.Thread(target=dsp.enable_eq, args=([0.0] * 10,)),
+            threading.Thread(target=dsp.enable_nr),
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        state_file = tmp_path / str(i) / "audio.json"
+        stored = json.loads(state_file.read_text(encoding="utf-8"))
+        assert stored["eq_enabled"] is True
+        assert stored["nr_enabled"] is True
+        assert isinstance(stored["eq_holder_pid"], int)
+        assert isinstance(stored["nr_holder_pid"], int)

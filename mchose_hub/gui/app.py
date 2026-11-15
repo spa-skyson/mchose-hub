@@ -214,7 +214,7 @@ def main() -> int:
         app = QApplication(sys.argv)
         app.setApplicationName(APP_TITLE)
         app.setOrganizationName("mchose-hub")
-        app.setApplicationVersion("0.2.0")
+        app.setApplicationVersion("0.2.2")
         app.setWindowIcon(
             QIcon(paint_battery_pixmap(100, charging=False, asleep=False))
         )

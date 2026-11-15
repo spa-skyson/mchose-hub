@@ -1,10 +1,15 @@
 """Исполнение аудио-DSP через PipeWire (pactl/wpctl/pw-cli/pw-dump).
 
-Фильтры EQ/NR живут в процессе-холдере `pw-cli`: PipeWire грузит
+Фильтры EQ/NR живут в процессах-холдерах `pw-cli`: PipeWire грузит
 libpipewire-module-filter-chain только как модуль клиента, поэтому процесс
-держится живым, пока эффект нужен; завершение холдера снимает эффект
-объекты графа. pactl умеет грузить только pulse-модули (loopback — да,
-filter-chain — нет), поэтому для filter-chain используется холдер.
+держится живым, пока эффект нужен. Popen-объекты холдеров хранятся на
+экземпляре (раздельные для EQ и NR), stdin держится открытым — EOF снял бы
+фильтр. Остановка: закрыть stdin → wait ≤3 c → иначе SIGKILL. Владение —
+только через живой Popen текущего запуска: pid из audio.json информационный
+и для сигналов не используется (pid-reuse; после рестарта факт графа
+проверяется наличием нод). pactl умеет грузить только pulse-модули
+(loopback — да, filter-chain — нет), поэтому для filter-chain используется
+холдер.
 
 Никаких print: библиотечный слой; ошибки — AudioError(message, hint).
 """
@@ -13,14 +18,16 @@ from __future__ import annotations
 
 import json
 import os
-import signal
 import subprocess
+import threading
 import time
 from pathlib import Path
 
 from .eq import (
     BAND_COUNT,
     EQ_NODE_INPUT,
+    GAIN_MAX,
+    GAIN_MIN,
     build_filter_chain_args,
     sanitize_gains,
 )
@@ -31,8 +38,8 @@ STATE_PATH = STATE_DIR / "audio.json"
 _SINK_POLL_TIMEOUT_S = 3.0
 _SINK_POLL_STEP_S = 0.1
 _SUBPROCESS_TIMEOUT_S = 10.0
+_HOLDER_STOP_TIMEOUT_S = 3.0
 
-NR_NODE_INPUT = "effect_input.mchose_nr"
 NR_NODE_OUTPUT = "effect_output.mchose_nr"
 _LADSPA_PLUGIN = "librnnoise_ladspa"
 _LADSPA_DIRS = ("/usr/lib/ladspa", "/usr/lib64/ladspa", "/usr/local/lib/ladspa")
@@ -61,9 +68,36 @@ def _default_state() -> dict[str, object]:
         "gains": [0.0] * BAND_COUNT,
         "nr_enabled": False,
         "monitor_enabled": False,
-        "holder_pid": None,
+        "eq_holder_pid": None,
+        "nr_holder_pid": None,
         "monitor_module_idx": None,
     }
+
+
+def _state_is_valid(stored: dict[str, object]) -> bool:
+    """Схема audio.json: флаги bool, gains — 10 чисел в [-12,12], pid — int|None.
+
+    Любое нарушение → вызывающий код отбрасывает файл целиком и пишет
+    дефолт (частично битый state хуже потерянного).
+    """
+    for key in ("eq_enabled", "nr_enabled", "monitor_enabled"):
+        if not isinstance(stored.get(key), bool):
+            return False
+    gains = stored.get("gains")
+    if not isinstance(gains, list) or len(gains) != BAND_COUNT:
+        return False
+    for gain in gains:
+        if isinstance(gain, bool) or not isinstance(gain, (int, float)):
+            return False
+        if not GAIN_MIN <= gain <= GAIN_MAX:
+            return False
+    for key in ("eq_holder_pid", "nr_holder_pid", "monitor_module_idx"):
+        value = stored.get(key)
+        if value is not None and (
+            isinstance(value, bool) or not isinstance(value, int)
+        ):
+            return False
+    return True
 
 
 class PipeWireDSP:
@@ -79,6 +113,13 @@ class PipeWireDSP:
         self._sink_hint = sink_hint
         self._source_hint = source_hint
         self.state_path = state_path if state_path is not None else STATE_PATH
+        # Владение фильтрами — только живые Popen текущего запуска (M1-M3):
+        # раздельные холдеры EQ и NR, stdin открыт всё время работы фильтра.
+        self._eq_holder: subprocess.Popen[str] | None = None
+        self._nr_holder: subprocess.Popen[str] | None = None
+        # audio.json пишут EQ- и NR-воркеры параллельно: RLock на
+        # read-modify-write + атомарный replace (MEDIUM-1).
+        self._state_lock = threading.RLock()
         self.state = self.load_state()
 
     # ---------- subprocess helpers ----------
@@ -110,11 +151,12 @@ class PipeWireDSP:
             raise AudioError(f"{what} не удалось: {result.stderr.strip()}")
         return result
 
-    def _spawn_holder(self, command: str) -> int:
+    def _spawn_holder(self, command: str) -> subprocess.Popen[str]:
         """Запустить процесс-холдер и выполнить в нём команду load-module.
 
-        Холдер держит stdin открытым: pw-cli ждёт следующую команду, модуль
-        и созданные им узлы графа живут, пока холдер жив.
+        Возвращает живой Popen: его держит экземпляр всё время работы
+        фильтра, stdin не закрывается — EOF завершил бы pw-cli и снял
+        фильтр-объекты из графа.
         """
         proc = subprocess.Popen(
             ["pw-cli"],
@@ -126,34 +168,36 @@ class PipeWireDSP:
         assert proc.stdin is not None
         proc.stdin.write(command + "\n")
         proc.stdin.flush()
-        return proc.pid
+        return proc
 
-    def _kill_holder(self) -> None:
-        """Завершить холдер: его фильтр-объекты исчезают из графа."""
-        pid = self.state.get("holder_pid")
-        if isinstance(pid, int) and self._is_our_holder(pid):
-            try:
-                os.kill(pid, signal.SIGTERM)
-                for _ in range(20):
-                    time.sleep(0.05)
-                    try:
-                        os.kill(pid, 0)
-                    except ProcessLookupError:
-                        break
-                else:
-                    os.kill(pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-        self._set_state(holder_pid=None)
+    def _stop_holder(self, holder: subprocess.Popen[str]) -> None:
+        """Остановить холдер: закрыть stdin (EOF) → wait ≤3 c → иначе SIGKILL.
 
-    @staticmethod
-    def _is_our_holder(pid: int) -> bool:
-        """Чужой pid мог переиспользоваться: холдер обязан быть pw-cli."""
+        При закрытии stdin pw-cli завершается и его фильтр-объекты
+        исчезают из графа. Popen может быть чужим для/wait мёртвого
+        процесса — ошибки не критичны.
+        """
         try:
-            cmdline = Path(f"/proc/{pid}/cmdline").read_bytes()
-        except OSError:
-            return False
-        return b"pw-cli" in cmdline
+            if holder.stdin is not None:
+                holder.stdin.close()
+            holder.wait(timeout=_HOLDER_STOP_TIMEOUT_S)
+        except subprocess.TimeoutExpired:
+            holder.kill()
+            holder.wait(timeout=_HOLDER_STOP_TIMEOUT_S)
+        except (OSError, ValueError):
+            pass  # холдер уже мёртв или stdin уже закрыт — цель достигнута
+
+    def _stale_filter_hint(self) -> str:
+        """Подсказка для фильтра прошлого сеанса: рестарт или ручная выгрузка.
+
+        PID из снимка pw-dump не называется: между снимком и действием
+        владельца проверить нельзя — нода могла сменить клиента.
+        """
+        return (
+            "перезапустите PipeWire (systemctl --user restart pipewire) "
+            "или выгрузите фильтр вручную через pw-cli "
+            "(узнайте индекс через pw-dump и проверьте владельца)"
+        )
 
     # ---------- discovery ----------
 
@@ -234,27 +278,48 @@ class PipeWireDSP:
     # ---------- persistence ----------
 
     def load_state(self) -> dict[str, object]:
-        """Состояние из ~/.config/mchose-hub/audio.json (или дефолт)."""
-        state = _default_state()
-        try:
-            stored = json.loads(self.state_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
+        """Состояние из ~/.config/mchose-hub/audio.json (или дефолт).
+
+        Любое нарушение схемы (битые гейны, не-bool флаги, чужие типы pid)
+        — файл целиком заменяется дефолтом: частично битый state хуже
+        потерянного.
+        """
+        with self._state_lock:
+            state = _default_state()
+            try:
+                stored = json.loads(self.state_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                return state
+            if not isinstance(stored, dict) or not _state_is_valid(stored):
+                self._write_state(state)
+                return state
+            state.update({k: v for k, v in stored.items() if k in state})
             return state
-        if not isinstance(stored, dict):
-            return state
-        state.update({k: v for k, v in stored.items() if k in state})
-        return state
 
     def save_state(self) -> None:
-        """Записать состояние (гейны, флаги, pid холдера)."""
-        self.state_path.parent.mkdir(parents=True, exist_ok=True)
-        self.state_path.write_text(
-            json.dumps(self.state, ensure_ascii=False, indent=1), encoding="utf-8"
-        )
+        """Записать состояние (гейны, флаги, информационные pid холдеров)."""
+        with self._state_lock:
+            self._write_state(self.state)
+
+    def _write_state(self, state: dict[str, object]) -> None:
+        """Атомарная запись: temp-файл + os.replace (RLock вложенный ок).
+
+        Параллельные записи EQ/NR-воркеров без replace давали бы окну
+        чтения усечённый/промежуточный файл.
+        """
+        with self._state_lock:
+            self.state_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self.state_path.parent / (self.state_path.name + ".tmp")
+            tmp.write_text(
+                json.dumps(state, ensure_ascii=False, indent=1), encoding="utf-8"
+            )
+            os.replace(tmp, self.state_path)
 
     def _set_state(self, **changes: object) -> None:
-        self.state.update(changes)
-        self.save_state()
+        """Read-modify-write state под замком (EQ/NR из разных воркеров)."""
+        with self._state_lock:
+            self.state.update(changes)
+            self._write_state(self.state)
 
     # ---------- EQ ----------
 
@@ -275,17 +340,20 @@ class PipeWireDSP:
                 "MCHOSE аудиокарта не найдена",
                 "подключите наушники по 2.4G (донгл = аудиокарта V9 Turbo+)",
             )
-        if self.eq_loaded():
+        if self._eq_holder is not None or self.eq_loaded():
             self.disable_eq()
         inputs = self._sink_inputs_of(physical)
+        self._eq_holder = self._spawn_holder(
+            self._holder_command(build_filter_chain_args(gains, physical))
+        )
         self._set_state(
-            holder_pid=self._spawn_holder(
-                self._holder_command(build_filter_chain_args(gains, physical))
-            ),
+            eq_holder_pid=self._eq_holder.pid,
             gains=[float(g) for g in gains],
         )
         if not self._wait_for_sink():
-            self._kill_holder()
+            self._stop_holder(self._eq_holder)
+            self._eq_holder = None
+            self._set_state(eq_holder_pid=None)
             raise AudioError(
                 "PipeWire не создал EQ-синк",
                 "проверьте журнал: journalctl --user -u pipewire",
@@ -297,7 +365,14 @@ class PipeWireDSP:
         return EQ_NODE_INPUT
 
     def disable_eq(self) -> str:
-        """Выключить EQ: default и потоки — на физический sink, холдер завершён."""
+        """Выключить EQ: default и потоки — на физический sink, фильтр снят.
+
+        Наш холдер — наш дочерний процесс: stdin → wait → SIGKILL, PipeWire
+        снимает его ноды сам; факт снятия проверяется (HIGH-2). Граф без
+        живого холдера (прошлый сеанс) не уничтожается автоматически —
+        pid не доказывает владение (HIGH-1): AudioError с ручной инструкцией,
+        state не меняется.
+        """
         physical = self.find_sink()
         if physical is None:
             raise AudioError(
@@ -308,9 +383,20 @@ class PipeWireDSP:
             self._set_default("sink", physical)
         for index in self._sink_inputs_of(EQ_NODE_INPUT):
             self._run(["pactl", "move-sink-input", str(index), physical])
-        self._kill_holder()
-        self._wait_until_gone("sinks", EQ_NODE_INPUT)
-        self._set_state(eq_enabled=False)
+        if self._eq_holder is not None:
+            self._stop_holder(self._eq_holder)
+            self._eq_holder = None
+            if not self._wait_until_gone("sinks", EQ_NODE_INPUT):
+                raise AudioError(
+                    "EQ-фильтр не снят: нода осталась в графе",
+                    "перезапустите PipeWire: systemctl --user restart pipewire",
+                )
+        elif self.eq_loaded():
+            raise AudioError(
+                "фильтр EQ прошлого сеанса активен",
+                self._stale_filter_hint(),
+            )
+        self._set_state(eq_enabled=False, eq_holder_pid=None)
         return physical
 
     def set_eq_gains(self, gains: list[float]) -> None:
@@ -370,13 +456,18 @@ class PipeWireDSP:
             time.sleep(_SINK_POLL_STEP_S)
         return False
 
-    def _wait_until_gone(self, kind: str, needle: str) -> None:
-        """Исчезновение сущности из `pactl list short <kind>` (poll ≤3 c)."""
+    def _wait_until_gone(self, kind: str, needle: str) -> bool:
+        """Исчезновение сущности из `pactl list short <kind>` (poll ≤3 c).
+
+        False — таймаут, сущность осталась: вызывающий код обязан не
+        фиксировать «выключено» (HIGH-2).
+        """
         deadline = time.monotonic() + _SINK_POLL_TIMEOUT_S
         while time.monotonic() < deadline:
             if not any(needle in name for name in self._short_list(kind)):
-                return
+                return True
             time.sleep(_SINK_POLL_STEP_S)
+        return False
 
     def _sink_inputs_of(self, sink_name: str) -> list[str]:
         """Индексы sink-inputs, подключённых к sink (по индексу sink)."""
@@ -426,7 +517,7 @@ class PipeWireDSP:
         """
         if not self.nr_supported():
             raise AudioError(f"LADSPA-плагин {_LADSPA_PLUGIN} не найден", RNNOISE_HINT)
-        if self.nr_loaded():
+        if self._nr_holder is not None or self.nr_loaded():
             self.disable_nr()
         source = self.find_source()
         if source is None:
@@ -455,13 +546,14 @@ class PipeWireDSP:
             "filter.graph": graph,
             "audio.position": ["MONO"],
         }
-        self._set_state(
-            holder_pid=self._spawn_holder(
-                self._holder_command(json.dumps(args, separators=(",", ":")))
-            )
+        self._nr_holder = self._spawn_holder(
+            self._holder_command(json.dumps(args, separators=(",", ":")))
         )
+        self._set_state(nr_holder_pid=self._nr_holder.pid)
         if not self._wait_for_node("sources", NR_NODE_OUTPUT):
-            self._kill_holder()
+            self._stop_holder(self._nr_holder)
+            self._nr_holder = None
+            self._set_state(nr_holder_pid=None)
             raise AudioError(
                 "PipeWire не создал NR-source",
                 "проверьте журнал: journalctl --user -u pipewire",
@@ -471,7 +563,11 @@ class PipeWireDSP:
         return NR_NODE_OUTPUT
 
     def disable_nr(self) -> str:
-        """Выключить шумоподавление: default source — физический, холдер завершён."""
+        """Выключить шумоподавление: default — физический source, фильтр снят.
+
+        Симметрично disable_eq: наш холдер — stdin/kill; посмертный граф —
+        AudioError без автоочистки и без изменения state (HIGH-1/HIGH-2).
+        """
         physical = self.find_source()
         if physical is None:
             raise AudioError(
@@ -480,9 +576,20 @@ class PipeWireDSP:
             )
         if self._default_of("source") == NR_NODE_OUTPUT:
             self._set_default("source", physical)
-        self._kill_holder()
-        self._wait_until_gone("sources", NR_NODE_OUTPUT)
-        self._set_state(nr_enabled=False)
+        if self._nr_holder is not None:
+            self._stop_holder(self._nr_holder)
+            self._nr_holder = None
+            if not self._wait_until_gone("sources", NR_NODE_OUTPUT):
+                raise AudioError(
+                    "NR-фильтр не снят: нода осталась в графе",
+                    "перезапустите PipeWire: systemctl --user restart pipewire",
+                )
+        elif self.nr_loaded():
+            raise AudioError(
+                "фильтр NR прошлого сеанса активен",
+                self._stale_filter_hint(),
+            )
+        self._set_state(nr_enabled=False, nr_holder_pid=None)
         return physical
 
     def nr_loaded(self) -> bool:
@@ -582,6 +689,17 @@ class PipeWireDSP:
             "загрузка module-loopback",
         )
         index = _parse_module_index(result.stdout)
+        if index is None:
+            # Никаких diff-снимков и авто-выгрузки: между снимками наш модуль
+            # мог исчезнуть, а чужой — появиться (гонка воспроизведена
+            # ревьюером) — выгрузка по diff бьёт по чужому модулю.
+            raise AudioError(
+                "маршрут мониторинга не активирован: не удалось разобрать "
+                "индекс модуля. Маршрут может остаться активным — выгрузите "
+                "его вручную: pactl unload-module <индекс из вывода "
+                "load-module>, или systemctl --user restart pipewire",
+                f"неожиданный ответ pactl: {result.stdout.strip()!r}",
+            )
         self._set_state(monitor_enabled=True, monitor_module_idx=index)
         return f"{source} -> {sink}"
 

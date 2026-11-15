@@ -37,6 +37,12 @@ EOF
   install -d "$pkgdir/usr/bin"
   cat > "$pkgdir/usr/bin/mchose-hub" <<'EOF'
 #!/usr/bin/env bash
+# Диспетчер: CLI-подкоманды → mchose_hub.cli, остальное (включая запуск
+# без аргументов) — GUI.
+CLI_CMDS="status mode shutdown prompt light eq mic"
+if [[ $# -gt 0 && " $CLI_CMDS " == *" $1 "* ]]; then
+  exec env PYTHONPATH=/usr/share/mchose-hub python3 -m mchose_hub.cli "$@"
+fi
 exec env PYTHONPATH=/usr/share/mchose-hub python3 -m mchose_hub.gui "$@"
 EOF
   chmod 755 "$pkgdir/usr/bin/mchose-hub"

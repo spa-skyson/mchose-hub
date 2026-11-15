@@ -51,6 +51,12 @@ if [[ "${1:-}" == "--entrypoint" ]]; then
   mkdir -p "$BIN_DIR"
   cat > "$BIN_DST" <<EOF
 #!/usr/bin/env bash
+# Диспетчер: первый аргумент — CLI-подкоманда (status/mode/shutdown/prompt/
+# light/eq/mic) → mchose_hub.cli; иначе (включая запуск без аргументов) — GUI.
+CLI_CMDS="status mode shutdown prompt light eq mic"
+if [[ \$# -gt 0 && " \$CLI_CMDS " == *" \$1 "* ]]; then
+  exec env PYTHONPATH="$PROJECT_DIR\${PYTHONPATH:+:\$PYTHONPATH}" python3 -m mchose_hub.cli "\$@"
+fi
 exec env PYTHONPATH="$PROJECT_DIR\${PYTHONPATH:+:\$PYTHONPATH}" python3 -m mchose_hub.gui "\$@"
 EOF
   chmod 0755 "$BIN_DST"
