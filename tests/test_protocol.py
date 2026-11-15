@@ -10,10 +10,12 @@ from mchose_hub import protocol as proto
 
 
 def test_build_battery_query_layout() -> None:
+    """Payload без reportId: [0x65, 0x01] + нули; ID добавляет транспорт."""
     frame = proto.build_battery_query()
     assert len(frame) == proto.HEADSET_FRAME_SIZE
-    assert frame[:3] == bytes((proto.HEADSET_REPORT_ID, 0x65, 0x01))
-    assert frame[3:] == bytes(proto.HEADSET_FRAME_SIZE - 3)
+    assert frame[:2] == bytes((0x65, 0x01))
+    assert frame[2:] == bytes(proto.HEADSET_FRAME_SIZE - 2)
+    assert proto.HEADSET_REPORT_ID not in frame  # двойного ID нет
 
 
 @pytest.mark.parametrize(
@@ -53,9 +55,9 @@ def test_parse_battery_stripped_form() -> None:
 
 def test_audio_mode_query_and_parse() -> None:
     query = proto.build_audio_mode_query()
-    assert query[:2] == b"\x55\x11"
+    assert query[:1] == b"\x11"
     assert len(query) == proto.HEADSET_FRAME_SIZE
-    assert not any(query[2:])
+    assert not any(query[1:])
     for mode in proto.AudioMode:
         payload = bytes((proto.HEADSET_REPORT_ID, 0x11, int(mode))) + bytes(60)
         assert proto.parse_audio_mode(payload) == int(mode)
@@ -65,16 +67,18 @@ def test_audio_mode_query_and_parse() -> None:
 
 def test_build_set_audio_mode_frame() -> None:
     frame = proto.build_set_audio_mode(proto.AudioMode.MUSIC)
-    assert frame[:4] == bytes((0x55, 0x21, 0x01, int(proto.AudioMode.MUSIC)))
+    assert frame[:3] == bytes((0x21, 0x01, int(proto.AudioMode.MUSIC)))
     assert len(frame) == proto.HEADSET_FRAME_SIZE
+    assert proto.HEADSET_REPORT_ID not in frame
 
 
 def test_settings_build_and_parse() -> None:
     set_frame = proto.build_settings(proto.SETTINGS_SUB_SET_AUTO_SHUTDOWN, 1)
-    assert set_frame[:4] == bytes((0x55, 0x22, 0, 1))
+    assert set_frame[:3] == bytes((0x22, 0, 1))
     read_frame = proto.build_settings(proto.SETTINGS_SUB_READ_PROMPT_VOLUME)
-    assert read_frame[:3] == bytes((0x55, 0x22, 4))
+    assert read_frame[:2] == bytes((0x22, 4))
     assert len(read_frame) == proto.HEADSET_FRAME_SIZE
+    assert proto.HEADSET_REPORT_ID not in set_frame
 
     response = bytes((0x55, 0x22, 4)) + bytes(60)
     assert proto.parse_settings_response(response, expect_value=True) == 4
@@ -87,17 +91,18 @@ def test_settings_build_and_parse() -> None:
 
 
 def test_channel_feature_frames() -> None:
-    """SET_FEATURE(0xAA): unlock/lock кадры по PROTOCOL.md §7."""
+    """SET_FEATURE(0xAA): payload без reportId — ID добавляет send_feature."""
     open_frame = proto.build_channel_open()
     close_frame = proto.build_channel_close()
     assert proto.FEATURE_AA_REPORT_ID == 0xAA
     assert proto.FEATURE_AA_SIZE == 63
     assert len(open_frame) == proto.FEATURE_AA_SIZE
     assert len(close_frame) == proto.FEATURE_AA_SIZE
-    assert open_frame[:3] == b"\xaa\x01\x01"
-    assert close_frame[:3] == b"\xaa\x01\x00"
-    assert open_frame[3:] == bytes(proto.FEATURE_AA_SIZE - 3)
-    assert close_frame[3:] == bytes(proto.FEATURE_AA_SIZE - 3)
+    assert open_frame[:2] == b"\x01\x01"
+    assert close_frame[:2] == b"\x01\x00"
+    assert open_frame[2:] == bytes(proto.FEATURE_AA_SIZE - 2)
+    assert close_frame[2:] == bytes(proto.FEATURE_AA_SIZE - 2)
+    assert 0xAA not in open_frame  # двойного ID нет
 
 
 def test_auto_shutdown_maps() -> None:
@@ -284,3 +289,47 @@ def test_parse_light_info_layout() -> None:
     )
     assert proto.parse_light_info(bytes(4)) is None
     assert proto.parse_global_info(bytes(10)) is None
+
+
+# --- Пассивные push-кадры настроек (захват M HUB) ---
+
+
+def test_parse_settings_push_capture_frames() -> None:
+    """Пуш-кадры из захвата: 55 22 04 0a (громкость 10), 55 22 02 00 (45 мин)."""
+    assert proto.parse_settings_push(bytes((0x55, 0x22, 0x04, 0x0A)) + bytes(59)) == (
+        proto.SETTINGS_SUB_READ_PROMPT_VOLUME,
+        10,
+    )
+    assert proto.parse_settings_push(bytes((0x55, 0x22, 0x02, 0x00)) + bytes(59)) == (
+        proto.SETTINGS_SUB_READ_AUTO_SHUTDOWN,
+        0,
+    )
+
+
+def test_parse_settings_push_stripped_form() -> None:
+    """Допустима форма без ведущего 0x55 (после снятия reportId)."""
+    assert proto.parse_settings_push(bytes((0x22, 0x02, 0x04)) + bytes(60)) == (
+        proto.SETTINGS_SUB_READ_AUTO_SHUTDOWN,
+        4,
+    )
+
+
+def test_parse_settings_push_rejects() -> None:
+    """Не настройки / set-подкоманды без value / чужой cmd — None."""
+    assert proto.parse_settings_push(bytes((0x55, 0x11, 0x02)) + bytes(60)) is None
+    assert proto.parse_settings_push(bytes((0x55, 0x22, 0x00)) + bytes(60)) is None
+    assert proto.parse_settings_push(bytes((0x55, 0x22, 0x01)) + bytes(60)) is None
+    assert proto.parse_settings_push(bytes((0x55, 0x22, 0x03)) + bytes(60)) is None
+    assert (
+        proto.parse_settings_push(bytes((0x66, 0x22, 0x04, 0x0A)) + bytes(59)) is None
+    )
+    assert proto.parse_settings_push(b"") is None
+
+
+def test_parse_battery_and_mode_on_capture_pushes() -> None:
+    """Батарея и режим из пуш-кадров захвата: 55 65 64 02, 55 11 02."""
+    battery = proto.parse_battery(bytes((0x55, 0x65, 0x64, 0x02)) + bytes(59))
+    assert battery == proto.BatteryState(
+        percent=100, charging=False, full=False, asleep=False
+    )
+    assert proto.parse_audio_mode(bytes((0x55, 0x11, 0x02)) + bytes(60)) == 2

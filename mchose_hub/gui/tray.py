@@ -186,6 +186,13 @@ class MchoseTray(QSystemTrayIcon):
         for value, action in self._mode_actions.items():
             action.setChecked(value == mode)
 
+    def clear_headset(self) -> None:
+        """Донгл отсутствует: сброс батареи, тултипа и отметок режима."""
+        self.setIcon(QIcon(paint_battery_pixmap(0, charging=False, asleep=True)))
+        self.setToolTip(_TOOLTIP_NO_DATA)
+        self._battery_action.setText(_TOOLTIP_NO_DATA)
+        self.update_mode(None)
+
     def update_shutdown(self, minutes: int | None) -> None:
         """Активное автоотключение в подменю."""
         if minutes is None:

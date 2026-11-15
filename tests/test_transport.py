@@ -359,14 +359,38 @@ def test_write_late_enodev_is_recoverable(
     device.close()
 
 
-def test_write_report_eio_keeps_plain_text(
+def test_write_late_eio_is_recoverable(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Не-ENODEV OSError сохраняет точный текст «ошибка записи в …» без маркера."""
+    """Задержанный EIO (исход после write_timeout_s, в grace) — восстановимый."""
+    monkeypatch.setattr(transport.os, "open", lambda *args, **kwargs: 42)
+    monkeypatch.setattr(transport.os, "close", lambda fd: None)
+
+    def late_eio(fd: int, data: bytes) -> int:
+        time.sleep(0.2)  # дольше write_timeout_s, в пределах grace
+        raise OSError(errno.EIO, "Ошибка ввода/вывода")
+
+    monkeypatch.setattr(transport.os, "write", late_eio)
+    device = transport.HidrawTransport(
+        "/dev/null", write_timeout_s=0.05, write_grace_s=1.0
+    )
+    with pytest.raises(transport.TransportError) as excinfo:
+        device.write_report(0x55, b"\x01")
+    assert "ошибка записи в" in excinfo.value.message
+    assert "[Errno 5]" in excinfo.value.message
+    assert "донгл будет найден заново" in excinfo.value.message
+    assert "пере-скан" in excinfo.value.hint
+    device.close()
+
+
+def test_write_report_other_oserror_keeps_plain_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """OSError без маркера отключения (не ENODEV/EIO) сохраняет точный текст."""
     device = _enodev_device(monkeypatch)
 
     def io_err(fd: int, data: bytes) -> int:
-        raise OSError(errno.EIO, "Input/output error")
+        raise OSError(errno.EPROTO, "Protocol error")
 
     monkeypatch.setattr(transport.os, "write", io_err)
     with pytest.raises(transport.TransportError) as excinfo:
@@ -422,3 +446,264 @@ def test_feature_enodev_is_recoverable(
     assert "устройство отключено" in excinfo.value.message
     assert "пере-скан" in excinfo.value.hint
     device.close()
+
+
+# --- Командный канал донгла: одна пара unlock/lock на транспорт (§7) ---
+
+
+class _IoctlLog:
+    """Журнал ioctl-вызовов: (директива, буфер) в порядке поступления."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[int, bytes]] = []
+
+    def __call__(self, fd: int, request: int, buf: bytearray) -> int:
+        self.calls.append((request, bytes(buf)))
+        return len(buf)
+
+
+def test_manage_channel_unlocks_on_open_locks_on_close(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """manage_channel=True: UNLOCK сразу после os.open, LOCK до os.close."""
+    monkeypatch.setattr(transport.os, "open", lambda *a, **kw: 42)
+    closed: list[int] = []
+    monkeypatch.setattr(transport.os, "close", lambda fd: closed.append(fd))
+    log = _IoctlLog()
+    monkeypatch.setattr(transport.fcntl, "ioctl", log)
+
+    unlock_buf = bytes((0xAA, 0x01, 0x01)) + bytes(61)
+    lock_buf = bytes((0xAA, 0x01, 0x00)) + bytes(61)
+    unlock_req = transport.hid_ioctl(get=False, length=64)
+    lock_req = unlock_req  # та же директива SET_FEATURE
+
+    device = transport.HidrawTransport("/dev/null", manage_channel=True)
+    assert log.calls == [(unlock_req, unlock_buf)]  # unlock один раз на open
+    device.close()
+    assert log.calls == [(unlock_req, unlock_buf), (lock_req, lock_buf)]
+    assert closed == [42]  # LOCK ушёл до снятия fd
+
+
+def test_default_transport_no_channel_frames(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Дефолт (док и probe-транспорты): никаких ioctl 0xAA на open/close."""
+    monkeypatch.setattr(transport.os, "open", lambda *a, **kw: 42)
+    monkeypatch.setattr(transport.os, "close", lambda fd: None)
+    log = _IoctlLog()
+    monkeypatch.setattr(transport.fcntl, "ioctl", log)
+    device = transport.HidrawTransport("/dev/null")
+    device.close()
+    assert log.calls == []
+
+
+def test_manage_channel_close_survives_dead_device(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """LOCK на устройстве, умершем ПОСЛЕ открытия, не ломает close.
+
+    UNLOCK при open проходит (устройство ещё живо), LOCK при close падает
+    с ENODEV — close глотает ошибку и закрывает fd штатно.
+    """
+    monkeypatch.setattr(transport.os, "open", lambda *a, **kw: 42)
+    monkeypatch.setattr(transport.os, "close", lambda fd: None)
+    calls = {"n": 0}
+
+    def dies_after_open(fd: int, request: int, buf: bytearray) -> int:
+        calls["n"] += 1
+        if calls["n"] > 1:  # первый ioctl — UNLOCK при open, дальше устройство мертво
+            raise OSError(errno.ENODEV, "No such device")
+        return len(buf)
+
+    monkeypatch.setattr(transport.fcntl, "ioctl", dies_after_open)
+    device = transport.HidrawTransport("/dev/null", manage_channel=True)
+    device.close()  # не бросает; fd закрыт штатно
+    assert device._fd == -1
+    assert calls["n"] == 2  # unlock на open + попытка lock на close
+
+
+def test_find_dongle_manages_channel_dock_does_not(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """find_dongle открывает транспорт с manage_channel=True, find_dock — нет."""
+    created: list[bool] = []
+
+    class _Recorder:
+        path = "/dev/fake"
+
+        def __init__(self, _path: str, *, manage_channel: bool = False) -> None:
+            created.append(manage_channel)
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(transport, "HidrawTransport", _Recorder)
+    monkeypatch.setattr(transport, "_HIDRAW_SYSFS", str(tmp_path / "hidraw"))
+    _make_uevent(tmp_path, "hidraw0", "0003:00003837:0000600A")  # донгл
+    _make_uevent(tmp_path, "hidraw1", "0003:00003837:00006008")  # док
+    transport.find_dongle()
+    transport.find_dock()
+    assert created == [True, False]
+
+
+# --- UNLOCK при открытии: неудача закрывает fd (дескриптор не течёт) ---
+
+
+def test_constructor_unlock_failure_closes_fd(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Упал UNLOCK в конструкторе: fd закрыт, исходное исключение проброшено."""
+    monkeypatch.setattr(transport.os, "open", lambda *a, **kw: 42)
+    closed: list[int] = []
+    monkeypatch.setattr(transport.os, "close", closed.append)
+
+    def dies(fd: int, request: int, buf: bytearray) -> int:
+        raise OSError(errno.ENODEV, "No such device")
+
+    monkeypatch.setattr(transport.fcntl, "ioctl", dies)
+    with pytest.raises(transport.TransportError) as excinfo:
+        transport.HidrawTransport("/dev/null", manage_channel=True)
+    assert closed == [42]  # fd освобождён до проброса
+    assert "устройство отключено" in excinfo.value.message  # ENODEV -> восстановимая
+    assert "пере-скан" in excinfo.value.hint
+
+
+# --- EIO (Errno 5) = отключение устройства, как ENODEV/EOF ---
+
+
+def test_read_report_eio_is_recoverable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """EIO на чтении hidraw (донгл вынули) — операция+errno и маркер пере-скана."""
+    monkeypatch.setattr(transport.os, "open", lambda *a, **kw: 42)
+    monkeypatch.setattr(transport.os, "close", lambda fd: None)
+    monkeypatch.setattr(transport.select, "select", lambda *a: ([42], [], []))
+
+    def eio_read(fd: int, size: int) -> bytes:
+        raise OSError(errno.EIO, "Ошибка ввода/вывода")
+
+    monkeypatch.setattr(transport.os, "read", eio_read)
+    device = transport.HidrawTransport("/dev/null")
+    with pytest.raises(transport.TransportError) as excinfo:
+        device.read_report(10)
+    assert "ошибка чтения" in excinfo.value.message
+    assert "[Errno 5]" in excinfo.value.message  # исходный errno сохранён
+    assert "донгл будет найден заново" in excinfo.value.message
+    assert "пере-скан" in excinfo.value.hint
+    device.close()
+
+
+def test_write_report_eio_is_recoverable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """EIO на записи — тот же формат: операция, errno, маркер пере-скана."""
+    device = _enodev_device(monkeypatch)
+
+    def eio_write(fd: int, data: bytes) -> int:
+        raise OSError(errno.EIO, "Ошибка ввода/вывода")
+
+    monkeypatch.setattr(transport.os, "write", eio_write)
+    with pytest.raises(transport.TransportError) as excinfo:
+        device.write_report(0x55, b"\x01")
+    assert "ошибка записи в" in excinfo.value.message
+    assert "[Errno 5]" in excinfo.value.message
+    assert "донгл будет найден заново" in excinfo.value.message
+    assert "пере-скан" in excinfo.value.hint
+    device.close()
+
+
+def test_feature_eio_is_plain_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    """EIO на SET_FEATURE — обычная ошибка: без маркера пере-скана."""
+    device = _enodev_device(monkeypatch)
+
+    def eio_ioctl(fd: int, request: int, buf: bytearray) -> int:
+        raise OSError(errno.EIO, "Ошибка ввода/вывода")
+
+    monkeypatch.setattr(transport.fcntl, "ioctl", eio_ioctl)
+    with pytest.raises(transport.TransportError) as excinfo:
+        device.send_feature(0xAA, b"\x01\x01")
+    assert "SET_FEATURE" in excinfo.value.message
+    assert "[Errno 5]" in excinfo.value.message
+    assert "донгл будет найден заново" not in excinfo.value.message
+    assert "устройство отключено" not in excinfo.value.message
+    device.close()
+
+
+# --- close(): LOCK через поток-писателя с бюджетом close_grace_s ---
+
+
+def test_close_returns_within_budget_on_blocking_ioctl(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Блокирующий LOCK-ioctl не держит close() дольше бюджета.
+
+    UNLOCK при открытии проходит сразу; LOCK при close залипает до
+    release: close() возвращается по close_grace_s, а fd закрывает
+    поток-писатель после завершения ioctl.
+    """
+    monkeypatch.setattr(transport.os, "open", lambda *a, **kw: 42)
+    closed: list[int] = []
+    monkeypatch.setattr(transport.os, "close", closed.append)
+    entered = threading.Event()
+    release = threading.Event()
+    calls = {"n": 0}
+
+    def wedged_lock_ioctl(fd: int, request: int, buf: bytearray) -> int:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return len(buf)  # UNLOCK при открытии — не залипает
+        entered.set()
+        release.wait(10)  # LOCK при close — залип дольше бюджета
+        return len(buf)
+
+    monkeypatch.setattr(transport.fcntl, "ioctl", wedged_lock_ioctl)
+    device = transport.HidrawTransport(
+        "/dev/null", manage_channel=True, close_grace_s=0.2
+    )
+    started = time.monotonic()
+    device.close()  # не ждёт release()
+    elapsed = time.monotonic() - started
+    assert entered.wait(2)  # LOCK-ioctl действительно залип
+    assert elapsed < 10  # вернулся по бюджету, а не по завершению ioctl
+    release.set()
+    # fd закрывает писатель после выхода из ioctl
+    deadline = time.monotonic() + 2
+    while not closed and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert closed == [42]
+    assert calls["n"] == 2  # unlock на open + ровно один lock на close
+
+
+def test_close_is_single_shot_under_wedged_ioctl(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Повторный close() при зависшем LOCK-ioctl: мгновенно, LOCK один раз."""
+    monkeypatch.setattr(transport.os, "open", lambda *a, **kw: 42)
+    closed: list[int] = []
+    monkeypatch.setattr(transport.os, "close", closed.append)
+    release = threading.Event()
+    calls = {"n": 0}
+
+    def wedged_lock_ioctl(fd: int, request: int, buf: bytearray) -> int:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return len(buf)  # UNLOCK при открытии
+        release.wait(10)  # LOCK при close — залип надолго
+        return len(buf)
+
+    monkeypatch.setattr(transport.fcntl, "ioctl", wedged_lock_ioctl)
+    device = transport.HidrawTransport(
+        "/dev/null", manage_channel=True, close_grace_s=0.2
+    )
+    started = time.monotonic()
+    device.close()  # первый: бюджет 0.2 с истекает, управление возвращено
+    assert time.monotonic() - started < 10
+    before_second = time.monotonic()
+    device.close()  # второй: _closing уже выставлен — мгновенный выход
+    assert time.monotonic() - before_second < 0.1
+    release.set()
+    deadline = time.monotonic() + 2
+    while not closed and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert closed == [42]
+    assert calls["n"] == 2  # LOCK не дублировался вторым close()

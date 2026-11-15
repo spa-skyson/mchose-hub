@@ -193,8 +193,17 @@ RECOVERY_DISCOVER_INTERVAL_S = 1.0
 
 
 def is_recoverable_transport(message: str) -> bool:
-    """Транспорт отравлен или устройство отключилось (EOF/ENODEV) — лечится пере-сканом."""
-    return "отравлен" in message or "устройство отключено" in message
+    """Транспорт отравлен или устройство отключилось (EOF/ENODEV/EIO на данных).
+
+    Маркеры: «отравлен» (застрявшая запись), «устройство отключено»
+    (EOF/ENODEV), «донгл будет найден заново» (EIO при чтении/записи).
+    Все лечатся пере-сканом.
+    """
+    return (
+        "отравлен" in message
+        or "устройство отключено" in message
+        or "донгл будет найден заново" in message
+    )
 
 
 def recovery_due(
@@ -204,6 +213,26 @@ def recovery_due(
 ) -> bool:
     """Разрешён ли discover() сейчас: не раньше, чем через interval_s после прошлого."""
     return last is None or now - last >= interval_s
+
+
+# --- опрос устройства: давность данных кэша ---
+
+
+def staleness_note(last_confirmed: float | None, now: float, threshold_s: float) -> str:
+    """Пометка давности кэша: «» — данные свежие, иначе « · N мин назад».
+
+    last_confirmed — время последнего подтверждённого кадра (пуш-кадр или
+    свежий ответ на явный запрос); None — подтверждений не было. Кэш
+    считается свежим, пока возраст не превысил threshold_s (один интервал
+    обновления батареи); порог в минутах и больше, поэтому формат —
+    всегда целые минуты («100% · 7 мин назад»).
+    """
+    if last_confirmed is None:
+        return ""
+    age_s = now - last_confirmed
+    if age_s < threshold_s:
+        return ""
+    return f" · {max(int(age_s // 60), 1)} мин назад"
 
 
 def with_transport_retry(
@@ -227,20 +256,19 @@ def with_transport_retry(
     return wrapped
 
 
-# --- опрос устройства: подсказка про спящий командный канал ---
+# --- опрос устройства: тишина наушников ---
 
-# Донгл паркует командный канал после простоя (PROTOCOL.md §7.1): пара
-# первых NAK — обычная тишина, с третьего подряд канал считается спящим.
-PARKED_CHANNEL_THRESHOLD = 3
+# Пара первых неответов опроса — обычная тишина; с третьего подряд
+# показываем подсказку вместо тихого статуса.
+HEADSET_SILENT_THRESHOLD = 3
 
-PARKED_CHANNEL_HINT = (
-    "Канал управления спит после простоя. Выньте и вставьте донгл, "
-    "пока наушники включены и играют звук — приложение подхватит автоматически."
+HEADSET_SILENT_HINT = (
+    "Наушники не отвечают — проверьте, что они включены и рядом с донглом"
 )
 
 
-def parked_channel_hint(streak: int) -> str | None:
+def headset_silent_hint(streak: int) -> str | None:
     """Подсказка после streak неответов опроса подряд; None — тихий текст."""
-    if streak >= PARKED_CHANNEL_THRESHOLD:
-        return PARKED_CHANNEL_HINT
+    if streak >= HEADSET_SILENT_THRESHOLD:
+        return HEADSET_SILENT_HINT
     return None

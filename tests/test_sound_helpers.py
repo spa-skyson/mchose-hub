@@ -9,10 +9,11 @@ from mchose_hub.gui.helpers import (
     CUSTOM_PRESET,
     EQ_SLIDER_MAX,
     EQ_SLIDER_MIN,
+    HEADSET_SILENT_HINT,
     Debounce,
     gain_to_slider,
+    headset_silent_hint,
     is_recoverable_transport,
-    parked_channel_hint,
     preset_for_gains,
     recovery_due,
     slider_to_gain,
@@ -109,6 +110,10 @@ def test_debounce_rearm_during_burst() -> None:
         "/dev/hidraw12: транспорт отравлен незавершённой записью",
         "/dev/hidraw12: устройство отключено (EOF)",
         "/dev/hidraw12: устройство отключено (переподключено)",
+        (
+            "ошибка чтения /dev/hidraw1: [Errno 5] Ошибка ввода/вывода; "
+            "донгл будет найден заново"
+        ),
     ],
 )
 def test_is_recoverable_transport_true(message: str) -> None:
@@ -203,19 +208,19 @@ def test_with_transport_retry_passes_other_errors() -> None:
         with_transport_retry(job, pytest.fail)()  # recover не должен вызываться
 
 
-# --- подсказка про спящий канал (NAK-ступени опроса) ---
+# --- подсказка при тишине наушников (NAK-ступени опроса) ---
 
 
-def test_parked_channel_hint_silent_first_two() -> None:
+def test_headset_silent_hint_silent_first_two() -> None:
     """Первая и вторая NAK подряд — тихий текст (None)."""
-    assert parked_channel_hint(1) is None
-    assert parked_channel_hint(2) is None
+    assert headset_silent_hint(1) is None
+    assert headset_silent_hint(2) is None
 
 
-def test_parked_channel_hint_from_third() -> None:
-    """Третья (и далее) NAK подряд — подсказка про передёргивание донгла."""
-    third = parked_channel_hint(3)
-    assert third is not None
-    assert "Выньте и вставьте донгл" in third
-    assert parked_channel_hint(4) == third
-    assert parked_channel_hint(50) == third
+def test_headset_silent_hint_from_third() -> None:
+    """Третья (и далее) NAK подряд — подсказка проверить наушники."""
+    third = headset_silent_hint(3)
+    assert third == HEADSET_SILENT_HINT
+    assert "включены и рядом с донглом" in third
+    assert headset_silent_hint(4) == third
+    assert headset_silent_hint(50) == third

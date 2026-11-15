@@ -85,8 +85,8 @@ class DeviceManager:
         блокировкой менеджера: между получением сервиса и началом команды
         discover() не может закрыть транспорт. Пока команда идёт, устаревшие
         транспорты закрываются только после выхода из контекста — fd не
-        закрывается между unlock и lock (PROTOCOL.md §7). None — устройство
-        отсутствует.
+        закрывается посреди команды (командный канал донгла открыт один раз
+        на транспорте, PROTOCOL.md §7). None — устройство отсутствует.
         """
         return self._command_session(device)
 
@@ -137,9 +137,10 @@ class DeviceManager:
         if not self._discover_lock.acquire(blocking=False):
             with self._discover_lock:
                 return self.snapshot
+        to_close: list[HidTransport] = []
         try:
             with self._lock:
-                self._retire_locked()
+                to_close = self._retire_locked()
                 dongle_error = dock_error = hint = ""
                 try:
                     dongle = find_dongle()
@@ -158,7 +159,7 @@ class DeviceManager:
                     DockService(self._dock) if self._dock is not None else None
                 )
                 devices = tuple(scan_hidraw())
-                self.snapshot = ManagerSnapshot(
+                snapshot = ManagerSnapshot(
                     dongle_path=self._dongle.path if self._dongle is not None else None,
                     dock_path=self._dock.path if self._dock is not None else None,
                     dongle_error=dongle_error,
@@ -166,17 +167,30 @@ class DeviceManager:
                     hint=hint,
                     devices=devices,
                 )
-                return self.snapshot
+                self.snapshot = snapshot
+            # Закрытие выведенных транспортов — вне блокировки менеджера:
+            # close() донгла с manage_channel выполняет LOCK через
+            # поток-писателя с бюджетом и может ждать ioctla — блокировка
+            # менеджера в это время должна быть свободна для command_session.
+            for transport in to_close:
+                transport.close()
+            return snapshot
         finally:
             self._discover_lock.release()
 
     def close(self) -> None:
         """Закрыть транспорты; при активных командах — отложить до их конца."""
         with self._lock:
-            self._retire_locked()
+            to_close = self._retire_locked()
+        for transport in to_close:
+            transport.close()
 
-    def _retire_locked(self) -> None:
-        """Снять сервисы; транспорты закрыть сейчас или после операций."""
+    def _retire_locked(self) -> list[HidTransport]:
+        """Снять сервисы; вернуть транспорты к закрытию ВНЕ блокировки менеджера.
+
+        При активных командах (_ops > 0) закрытие откладывается: транспорты
+        уезжают в _stale и закрываются после выхода из command_session.
+        """
         transports = [t for t in (self._dongle, self._dock) if t is not None]
         self._dongle = None
         self._dock = None
@@ -184,9 +198,8 @@ class DeviceManager:
         self._dock_service = None
         if self._ops > 0:
             self._stale.extend(transports)
-            return
-        for transport in transports:
-            transport.close()
+            return []
+        return transports
 
 
 def try_acquire_single_instance() -> QLockFile | None:
@@ -214,7 +227,7 @@ def main() -> int:
         app = QApplication(sys.argv)
         app.setApplicationName(APP_TITLE)
         app.setOrganizationName("mchose-hub")
-        app.setApplicationVersion("0.2.3")
+        app.setApplicationVersion("0.3.1")
         app.setWindowIcon(
             QIcon(paint_battery_pixmap(100, charging=False, asleep=False))
         )

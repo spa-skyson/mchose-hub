@@ -25,7 +25,13 @@ from ..transport import ETIMEDOUT_HEADSET_HINT, UDEV_HINT
 from .app import ManagerSnapshot
 from .dock_tab import DockTab
 from .headset_tab import HeadsetTab
-from .helpers import parked_channel_hint, recovery_due, with_transport_retry
+from .helpers import (
+    headset_silent_hint,
+    is_recoverable_transport,
+    recovery_due,
+    staleness_note,
+    with_transport_retry,
+)
 from .sound_tab import SoundTab
 from .tray import MchoseTray
 from .workers import WorkerHost
@@ -33,9 +39,15 @@ from .workers import WorkerHost
 if TYPE_CHECKING:
     from PyQt6.QtGui import QCloseEvent
 
-# Командный канал донгла паркуется при простое (PROTOCOL.md §7.1): опрос
-# каждые 15 с удерживает канал живым; при 30 с канал NAK-ается через минуты.
+# Тик цикла опроса: пассивный приём пуш-кадров донгла и показ кэша —
+# без записи в устройство. Явные команды уходят только после (пере)подключения
+# и по бюджету батареи (эталон M HUB: периодического опроса нет, ~10 команд
+# за 3 часа, все — действия пользователя).
 _POLL_INTERVAL_MS = 15_000
+# Явный запрос батареи — не чаще раза в 5 минут (захват M HUB: батарея
+# запрошена один раз через 54 с после старта, дальше 3 часа — сохранённое
+# значение; актуализацию делает пассивный приём push-кадров).
+_BATTERY_REFRESH_INTERVAL_S = 5 * 60
 _WINDOW_TITLE = "MCHOSE Hub — V9 Turbo+"
 _TAB_HEADSET = "Наушники"
 _TAB_SOUND = "Звук"
@@ -86,6 +98,22 @@ class MainWindow(QMainWindow):
         self._shutdown_done = False
         self._last_recovery_discover: float | None = None
         self._nak_streak = 0
+        # Бюджет явных запросов: полное обновление после (пере)подключения,
+        # батарея — не чаще _BATTERY_REFRESH_INTERVAL_S. Флаги из воркеров и
+        # GUI-потока: присваивание атомарно, гонка даёт лишний/пропущенный
+        # один запрос до следующего тика — безвредно.
+        self._pending_refresh = True
+        self._battery_queried_at: float | None = None
+        # Время последнего подтверждённого кадра (пуш или свежий ответ):
+        # отделяет живой канал от показа кэша. None — подтверждений не было.
+        self._last_confirmed_at: float | None = None
+        # Снимок discover() из тика без донгла (воркер) к применению в
+        # GUI-потоке: пара (поколение снимков на момент скана, снимок).
+        # Пока воркер сканировал, reconnect мог применить свой снимок —
+        # устаревший снимок тика при применении отбрасывается.
+        self._pending_snapshot: tuple[int, ManagerSnapshot] | None = None
+        # Поколение применённых снимков: растёт на каждый _apply_snapshot.
+        self._snapshot_seq = 0
 
         self.setWindowTitle(_WINDOW_TITLE)
         self.resize(760, 560)
@@ -226,12 +254,16 @@ class MainWindow(QMainWindow):
         self._status.showMessage(message, 5000)
 
     def poll_now(self) -> None:
-        """Немедленный опрос батареи/режима; тик при активном опросе пропускается.
+        """Тик цикла: пассивный приём + явные запросы по бюджету.
 
-        Таймер не останавливается: зависший воркер не паркует канал навсегда,
-        следующий тик повторит попытку, а таймаут записи на транспорте делает
-        воркеры конечными. Отравленный транспорт/EOF лечится на месте:
-        пере-скан и одноразовый ретрай (см. recover_transport).
+        Таймер не останавливается: зависший воркер не блокирует цикл
+        навсегда, следующий тик повторит попытку, а таймаут записи на
+        транспорте делает воркеры конечными. Отравленный транспорт,
+        EOF/ENODEV/EIO лечатся на месте: пере-скан и одноразовый ретрай
+        (recover_transport). Запись в донгл — только по бюджету: полное
+        обновление после (пере)подключения, батарея не чаще
+        _BATTERY_REFRESH_INTERVAL_S; между ними GUI показывает кэш,
+        обновлённый пассивным приёмом.
         """
         if self._poll_active:
             return
@@ -239,56 +271,136 @@ class MainWindow(QMainWindow):
         if not self._poll_timer.isActive():
             self._poll_timer.start()
 
-        def on_success(
-            result: tuple[BatteryState | None, AudioMode | None],
-        ) -> None:
-            self._poll_active = False
-            battery, mode = result
-            if battery is None and mode is None:
-                # Канал не ответил: пара первых NAK — тишина, с третьего
-                # подряд — подсказка про спящий после простоя канал.
-                self._nak_streak += 1
-                hint = parked_channel_hint(self._nak_streak)
-                self.note(hint if hint is not None else _POLL_NO_ANSWER)
-                return
-            self._nak_streak = 0  # любой полученный ответ — канал жив
-            if battery is not None:
-                self._headset_tab.apply_battery(battery)
-                if self._tray is not None:
-                    self._tray.update_battery(battery)
-                self.clear_error()
-                if not self._settings_loaded:
-                    self._settings_loaded = True
-                    self._headset_tab.reload_settings()
-            else:
-                self.note(_POLL_BATTERY_SILENT)
-            if mode is not None:
-                self._headset_tab.apply_mode(mode)
-                if self._tray is not None:
-                    self._tray.update_mode(mode)
-            else:
-                self._headset_tab.mark_mode_unknown()
-                if battery is not None:
-                    self.note(_POLL_MODE_SILENT)
-
-        def on_failure(message: str, hint: str) -> None:
-            self._poll_active = False
-            self.report_error(message, hint)
-
         self._workers.run(
             with_transport_retry(self._poll_headset, self.recover_transport),
-            on_success,
-            on_failure,
+            self._apply_poll_result,
+            self._on_poll_failure,
             device="headset-poll",
         )
 
-    def _poll_headset(self) -> tuple[BatteryState | None, AudioMode | None]:
-        """Один проход опроса в свежей command_session (ретрай открывает новую)."""
+    def _apply_poll_result(
+        self, result: tuple[BatteryState | None, AudioMode | None, bool]
+    ) -> None:
+        """Показ результата тика опроса; при подтверждении — сброс давности."""
+        self._poll_active = False
+        pending = self._pending_snapshot
+        self._pending_snapshot = None
+        if pending is not None:
+            seq, snapshot = pending
+            if seq == self._snapshot_seq:
+                # Снимок тика свежий: применяем (находка донгла планирует
+                # полное обновление через poll_now), результат неактуален.
+                self._apply_snapshot(snapshot)
+                return
+            # Пока воркер сканировал, reconnect применил более свежий
+            # снимок (поколение ушло вперёд): снимок тика и его результат
+            # отбрасываем — состояние UI не трогаем.
+            return
+        battery, mode, confirmed = result
+        now = time.monotonic()
+        if confirmed:
+            # Кадр получен за тик (пуш или свежий ответ): канал жив.
+            self._last_confirmed_at = now
+        note = staleness_note(self._last_confirmed_at, now, _BATTERY_REFRESH_INTERVAL_S)
+        if battery is None and mode is None:
+            if self._manager.headset_service() is None:
+                # Ретрай после восстанавливаемой ошибки закончился без донгла
+                # (новый узел ещё не появился): показанное состояние ничем
+                # не подтверждено — очистить до появления нового узла.
+                self._clear_headset_state()
+                return
+            # Канал не ответил: пара первых NAK — тишина, с третьего
+            # подряд — подсказка проверить сами наушники.
+            self._nak_streak += 1
+            hint = headset_silent_hint(self._nak_streak)
+            self.note(hint if hint is not None else _POLL_NO_ANSWER)
+            return
+        self._nak_streak = 0  # любой полученный ответ — канал жив
+        if battery is not None:
+            self._headset_tab.apply_battery(battery, note=note)
+            if self._tray is not None:
+                self._tray.update_battery(battery)
+            self.clear_error()
+            if not self._settings_loaded:
+                self._settings_loaded = True
+                self._headset_tab.reload_settings()
+        else:
+            self.note(_POLL_BATTERY_SILENT)
+        if mode is not None:
+            self._headset_tab.apply_mode(mode)
+            if self._tray is not None:
+                self._tray.update_mode(mode)
+        else:
+            self._headset_tab.mark_mode_unknown()
+            if battery is not None:
+                self.note(_POLL_MODE_SILENT)
+
+    def _on_poll_failure(self, message: str, hint: str) -> None:
+        """Ошибка тика; восстановимая — очистить показ до пере-скана."""
+        self._poll_active = False
+        if is_recoverable_transport(message):
+            # Транспорт умер (отравлен/EOF/ENODEV/EIO): показанное
+            # состояние больше ничем не подтверждено — очистим до
+            # пере-скана (на следующем тике или после ретрая).
+            self._clear_headset_state()
+        self.report_error(message, hint)
+
+    def _poll_headset(self) -> tuple[BatteryState | None, AudioMode | None, bool]:
+        """Один тик опроса в command_session (ретрай открывает новую).
+
+        Пассивный приём — каждый тик (только чтение). Явные команды: после
+        (пере)подключения — батарея и режим; дальше батарея не чаще
+        _BATTERY_REFRESH_INTERVAL_S (режим приходит пуш-кадром). Иначе —
+        значения из кэша. Третий элемент — подтверждён ли канал за тик:
+        счётчик принятых кадров вырос за ВЕСЬ тик (пуш или свежий ответ на
+        явный запрос — тогда пометка давности снимается этим же тиком).
+        """
         with self._manager.command_session("headset") as service:
             if service is None:
-                return None, None
-            # Раздельные запросы: батарея видна, даже если режим молчит.
-            return service.poll_battery(), service.poll_audio_mode()
+                # Донгла нет: повторный пере-скан прямо в воркере (не в GUI),
+                # с существующим бюджетом частоты discovery (recovery_due,
+                # общий с recover_transport) — не чаще раза в секунду и
+                # раза за тик (тип тика 15 с). Снимок применит GUI-поток.
+                # Поколение запоминаем ДО скана: если пока мы сканировали
+                # reconnect применил свой снимок, наш устареет.
+                now = time.monotonic()
+                if recovery_due(self._last_recovery_discover, now):
+                    self._last_recovery_discover = now
+                    seq = self._snapshot_seq
+                    self._pending_snapshot = (seq, self._manager.discover())
+                return None, None, False
+            frames_before = service.frames_received()
+            service.pump_passive()
+            now = time.monotonic()
+            if self._pending_refresh:
+                self._pending_refresh = False
+                self._battery_queried_at = now
+                # Раздельные запросы: батарея видна, даже если режим молчит.
+                battery, mode = service.poll_battery(), service.poll_audio_mode()
+            elif (
+                self._battery_queried_at is None
+                or now - self._battery_queried_at >= _BATTERY_REFRESH_INTERVAL_S
+            ):
+                self._battery_queried_at = now
+                battery = service.poll_battery()
+                mode = service.cached_audio_mode()
+            else:
+                battery = service.cached_battery()
+                mode = service.cached_audio_mode()
+            confirmed = service.frames_received() > frames_before
+            return battery, mode, confirmed
+
+    def _clear_headset_state(self) -> None:
+        """Донгла нет (не найден или транспорт умер): очистить показ состояния.
+
+        Кэш без живого канала не подтверждает присутствие наушников:
+        сбрасываем пометку давности, счётчик NAK, виджеты вкладки и трей.
+        """
+        self._last_confirmed_at = None
+        self._nak_streak = 0
+        self._headset_tab.set_available(False)
+        if self._tray is not None:
+            self._tray.clear_headset()
 
     def recover_transport(self) -> None:
         """Пере-скан устройств для авто-восстановления (вызов из воркер-потоков).
@@ -296,12 +408,16 @@ class MainWindow(QMainWindow):
         Бюджет: не чаще одного discover() в секунду — иначе шторм NAK
         устраивает цикл пересканирования. Вне бюджета пропуск: ретрай
         повторит ошибку, восстановление случится на следующем тике.
+        После пере-скана сервисы пересозданы (кэш пуст) — планируем
+        полное обновление состояния.
         """
         now = time.monotonic()
         if not recovery_due(self._last_recovery_discover, now):
             return
         self._last_recovery_discover = now
         self._manager.discover()
+        self._pending_refresh = True
+        self._settings_loaded = False
 
     def shutdown(self) -> bool:
         """Единый путь остановки: таймер опроса, воркеры, менеджер. Идемпотентен.
@@ -366,12 +482,23 @@ class MainWindow(QMainWindow):
         self.report_error(message, hint)
 
     def _apply_snapshot(self, snapshot: ManagerSnapshot) -> None:
+        # Новое поколение снимков: pending-снимки тиков, записанные до этого
+        # применения, устаревают и отбрасываются при доставке.
+        self._snapshot_seq += 1
         errors = [e for e in (snapshot.dongle_error, snapshot.dock_error) if e]
         if errors:
             self.report_error("\n".join(errors), snapshot.hint)
         else:
             self.clear_error()
-        self._headset_tab.set_available(snapshot.has_dongle)
+        if snapshot.has_dongle:
+            # (Пере)подключение донгла: сервис пересоздан, кэш пуст —
+            # полное обновление состояния на ближайшем тике.
+            self._pending_refresh = True
+            self._settings_loaded = False
+            self._headset_tab.set_available(True)
+        else:
+            # Донгл не найден: показанное состояние наушников не подтверждено.
+            self._clear_headset_state()
         self._dock_tab.set_available(snapshot.has_dock)
         self._device_labels[_DONGLE_ROW].setText(
             f"{snapshot.dongle_path} — {_FOUND}" if snapshot.has_dongle else _NOT_FOUND

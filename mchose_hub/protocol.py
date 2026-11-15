@@ -46,13 +46,21 @@ FEATURE_AA_SIZE = 63
 
 
 def build_channel_open() -> bytes:
-    """UNLOCK канала: [0xAA, 0x01, 0x01] + нули, 63 байта данных."""
-    return bytes((FEATURE_AA_REPORT_ID, 0x01, 0x01)) + bytes(FEATURE_AA_SIZE - 3)
+    """UNLOCK канала: payload [0x01, 0x01] + нули, 63 байта (без reportId).
+
+    reportId 0xAA добавляет send_feature первым байтом ioctl-буфера;
+    на проводе кадр: [0xAA, 0x01, 0x01] + нули, 64 байта.
+    """
+    return bytes((0x01, 0x01)) + bytes(FEATURE_AA_SIZE - 2)
 
 
 def build_channel_close() -> bytes:
-    """LOCK канала: [0xAA, 0x01, 0x00] + нули, 63 байта данных."""
-    return bytes((FEATURE_AA_REPORT_ID, 0x01, 0x00)) + bytes(FEATURE_AA_SIZE - 3)
+    """LOCK канала: payload [0x01, 0x00] + нули, 63 байта (без reportId).
+
+    reportId 0xAA добавляет send_feature; на проводе:
+    [0xAA, 0x01, 0x00] + нули, 64 байта.
+    """
+    return bytes((0x01, 0x00)) + bytes(FEATURE_AA_SIZE - 2)
 
 
 AUTO_SHUTDOWN_MINUTES_TO_VALUE: dict[int, int] = {15: 1, 30: 4, 45: 0}
@@ -157,7 +165,12 @@ class DockLighting:
 
 
 def _headset_frame(header: bytes) -> bytes:
-    """Кадр наушников: header + нулевой паддинг до 63 байт."""
+    """Payload команды наушников (БЕЗ reportId): header + паддинг до 63.
+
+    reportId 0x55 добавляет транспорт первым байтом interrupt OUT;
+    на проводе кадр: [0x55, header...] + нули, 64 байта. Ранние версии
+    клали 0x55 и в payload — ID дублировался (баг 0.3.0, см. §7).
+    """
     frame = bytearray(HEADSET_FRAME_SIZE)
     frame[: len(header)] = header
     return bytes(frame)
@@ -177,8 +190,8 @@ def _match_headset(data: bytes, cmd: int) -> int | None:
 
 
 def build_battery_query() -> bytes:
-    """Запрос батареи: [0x55, 0x65, 0x01] + нули, 63 байта."""
-    return _headset_frame(bytes((HEADSET_REPORT_ID, _BATTERY_CMD, 0x01)))
+    """Запрос батареи: payload [0x65, 0x01] + нули; на проводе [0x55, 0x65, 0x01]."""
+    return _headset_frame(bytes((_BATTERY_CMD, 0x01)))
 
 
 def parse_battery(data: bytes) -> BatteryState | None:
@@ -198,19 +211,18 @@ def parse_battery(data: bytes) -> BatteryState | None:
 
 
 def build_audio_mode_query() -> bytes:
-    """Запрос режима звука: [0x55, 0x11] + нули, 63 байта."""
-    return _headset_frame(bytes((HEADSET_REPORT_ID, _AUDIO_MODE_QUERY_CMD)))
+    """Запрос режима звука: payload [0x11] + нули; на проводе [0x55, 0x11]."""
+    return _headset_frame(bytes((_AUDIO_MODE_QUERY_CMD,)))
 
 
 def build_set_audio_mode(mode: AudioMode) -> bytes:
-    """Установка режима звука: [0x55, 0x21, 0x01, mode].
+    """Установка режима звука: payload [0x21, 0x01, mode]; на проводе
+    [0x55, 0x21, 0x01, mode].
 
     PROTOCOL.md отмечает, что официальное ПО отправляет укороченный
     15-байтовый вариант кадра; здесь используется полный 63-байтовый.
     """
-    return _headset_frame(
-        bytes((HEADSET_REPORT_ID, _AUDIO_MODE_SET_CMD, 0x01, int(mode)))
-    )
+    return _headset_frame(bytes((_AUDIO_MODE_SET_CMD, 0x01, int(mode))))
 
 
 def parse_audio_mode(data: bytes) -> int | None:
@@ -227,8 +239,9 @@ def parse_audio_mode(data: bytes) -> int | None:
 
 
 def build_settings(sub_id: int, value: int | None = None) -> bytes:
-    """Настройки: [0x55, 0x22, subId, value?] + нули, 63 байта."""
-    header = [HEADSET_REPORT_ID, _SETTINGS_CMD, sub_id]
+    """Настройки: payload [0x22, subId, value?] + нули; на проводе
+    [0x55, 0x22, subId, value?]."""
+    header = [_SETTINGS_CMD, sub_id]
     if value is not None:
         header.append(value)
     return _headset_frame(bytes(header))
@@ -251,6 +264,23 @@ def parse_settings_response(data: bytes, expect_value: bool) -> int | None:
     if len(data) <= idx:
         return None
     return data[idx]
+
+
+def parse_settings_push(data: bytes) -> tuple[int, int] | None:
+    """Пассивный кадр настроек [0x55, 0x22, sub, value] -> (sub, value).
+
+    Донгл сам присылает статус при изменениях без запроса (захват M HUB:
+    `55 22 04 0a` — громкость 10, `55 22 02 00` — автоотключение 45 мин).
+    sub ограничен read-подкомандами 2/4: кадры set-подтверждений (sub 0/1/3,
+    без value) кэшем настроек не являются.
+    """
+    idx = _match_headset(data, _SETTINGS_CMD)
+    if idx is None or len(data) < idx + 2:
+        return None
+    sub, value = data[idx], data[idx + 1]
+    if sub not in (SETTINGS_SUB_READ_AUTO_SHUTDOWN, SETTINGS_SUB_READ_PROMPT_VOLUME):
+        return None
+    return sub, value
 
 
 def auto_shutdown_value_to_minutes(value: int) -> int | None:

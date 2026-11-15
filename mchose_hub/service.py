@@ -12,11 +12,16 @@ import time
 from dataclasses import replace
 
 from . import protocol
-from .transport import HidTransport, TransportError
+from .transport import HidTransport
 
 READ_TIMEOUT_MS = 800
 SETTLE_DELAY_S = 0.05
 DRAIN_TIMEOUT_MS = 200
+# Пассивный приём: бюджет ожидания первого пуш-кадра за тик pump_passive.
+# Донгл присылает статус сам (PROTOCOL.md §1 push-уведомления, §7 захват
+# M HUB: 55 11 02, 55 22 04 0a, 55 65 64 02, 55 22 02 00).
+PASSIVE_TIMEOUT_MS = 10
+PASSIVE_MAX_FRAMES = 16
 
 
 def _strip_report_id(frame: bytes, frame_size: int) -> bytes:
@@ -25,7 +30,14 @@ def _strip_report_id(frame: bytes, frame_size: int) -> bytes:
 
 
 class HeadsetService:
-    """Управление наушниками через донгл (PROTOCOL.md §1)."""
+    """Управление наушниками через донгл (PROTOCOL.md §1).
+
+    Командный канал донгла открывается транспортом ОДИН раз при подключении
+    (эталон M HUB) — команды уходят простой interrupt OUT записью. Донгл
+    присылает статус и сам (push-кадры 0x55 65/11/22): всё прочитанное
+    разбирается и обновляет кэш состояния, который отдаётся GUI между
+    явными запросами.
+    """
 
     def __init__(
         self,
@@ -38,45 +50,116 @@ class HeadsetService:
         self._read_timeout_ms = read_timeout_ms
         self._settle_delay_s = settle_delay_s
         self._lock = threading.Lock()
+        # Кэш последнего известного состояния: пишется из любых чтений
+        # (ответы и пуш-кадры), читается GUI между явными запросами.
+        self._cache_lock = threading.Lock()
+        self._cached_battery: protocol.BatteryState | None = None
+        self._cached_audio_mode: protocol.AudioMode | None = None
+        self._cached_auto_shutdown: int | None = None  # минуты
+        self._cached_prompt_volume: int | None = None
+        # Счётчик разобранных кадров: признак живого канала для GUI.
+        self._frames_rx = 0
 
-    def _query(self, payload: bytes) -> bytes | None:
-        """Сессия команда-ответ под блокировкой: unlock -> write -> read -> lock.
+    def _ingest(self, frame: bytes) -> None:
+        """Разобрать прочитанный кадр 0x55 и обновить кэш состояния.
 
-        Каждая команда наушников обслуживается донглом только после
-        UNLOCK командного канала (PROTOCOL.md §7); LOCK выполняется и при
-        ошибке записи/чтения (finally). Наружу всегда уходит исходное
-        исключение записи/чтения: ошибка LOCK на уже отравленном транспорте
-        не информативна (нет подсказки) и глушится; ошибка LOCK при живой
-        записи пробрасывается — она первая и информативная.
+        Годится для ответов и пассивных пуш-кадров (батарея/режим/настройки):
+        parse_* сами отсеивают чужие команды. Кадры настроек — форма
+        [0x55, 0x22, sub, value] с read-подкомандами 2/4.
+        """
+        data = _strip_report_id(frame, protocol.HEADSET_FRAME_SIZE)
+        with self._cache_lock:
+            self._frames_rx += 1
+            if (state := protocol.parse_battery(data)) is not None:
+                self._cached_battery = state
+            elif (mode := protocol.parse_audio_mode(data)) is not None:
+                self._cached_audio_mode = protocol.AudioMode(mode)
+            elif (push := protocol.parse_settings_push(data)) is not None:
+                sub, value = push
+                if sub == protocol.SETTINGS_SUB_READ_AUTO_SHUTDOWN:
+                    self._cached_auto_shutdown = (
+                        protocol.auto_shutdown_value_to_minutes(value)
+                    )
+                elif sub == protocol.SETTINGS_SUB_READ_PROMPT_VOLUME:
+                    self._cached_prompt_volume = value
+
+    def pump_passive(self, timeout_ms: int = PASSIVE_TIMEOUT_MS) -> int:
+        """Принять пассивные кадры донгла БЕЗ записи в устройство.
+
+        Один тик GUI-опроса: короткое чтение, разбор пуш-кадров, кэш.
+        Возвращает число разобранных кадров; TransportError (мёртвый
+        транспорт) пробрасывается — лечится ретраем с пере-сканом.
+        Блокировка сервиса держится на весь цикл чтения: пассивный приём
+        не должен забрать ответ параллельной команды — она дождётся
+        своего ответа, пуши останутся на следующий тик.
         """
         with self._lock:
-            self._transport.unlock_command_channel()
-            original: TransportError | None = None
-            try:
-                self._transport.write_report(protocol.HEADSET_REPORT_ID, payload)
-                frame = self._transport.read_report(self._read_timeout_ms)
-            except TransportError as exc:
-                original = exc
-                raise
-            finally:
-                try:
-                    self._transport.lock_command_channel()
-                except TransportError:
-                    if original is None:
-                        raise
+            count = 0
+            while count < PASSIVE_MAX_FRAMES:
+                frame = self._transport.read_report(
+                    timeout_ms if count == 0 else 0  # хвост дренируем без ожидания
+                )
+                if frame is None:
+                    break
+                self._ingest(frame)
+                count += 1
+            return count
+
+    def frames_received(self) -> int:
+        """Сколько кадров 0x55 разобрано за жизнь сервиса (ответы и пуши).
+
+        Признак живого канала для GUI: счётчик растёт — кадр пришёл
+        (пуш-кадр или свежий ответ на явный запрос).
+        """
+        with self._cache_lock:
+            return self._frames_rx
+
+    def cached_battery(self) -> protocol.BatteryState | None:
+        """Последнее известное состояние батареи (ответ или пуш)."""
+        with self._cache_lock:
+            return self._cached_battery
+
+    def cached_audio_mode(self) -> protocol.AudioMode | None:
+        """Последний известный режим звука (ответ или пуш)."""
+        with self._cache_lock:
+            return self._cached_audio_mode
+
+    def cached_auto_shutdown(self) -> int | None:
+        """Последнее известное автоотключение в минутах."""
+        with self._cache_lock:
+            return self._cached_auto_shutdown
+
+    def cached_prompt_volume(self) -> int | None:
+        """Последняя известная громкость подсказок."""
+        with self._cache_lock:
+            return self._cached_prompt_volume
+
+    def _query(self, payload: bytes) -> bytes | None:
+        """Команда-ответ под блокировкой сервиса; канал уже открыт транспортом.
+
+        UNLOCK/LOCK вокруг отдельных команд не выполняются: M HUB открывает
+        канал ОДИН раз на подключение (PROTOCOL.md §7), пере-открытие —
+        только при новом транспорте после восстановления. Каждый прочитанный
+        кадр разбирается в кэш: между ответами приходят и пассивные пуш-кадры.
+        """
+        with self._lock:
+            self._transport.write_report(protocol.HEADSET_REPORT_ID, payload)
+            frame = self._transport.read_report(self._read_timeout_ms)
         if frame is None:
             return None
+        self._ingest(frame)
         return _strip_report_id(frame, protocol.HEADSET_FRAME_SIZE)
 
-    def _read_accept_locked(self) -> bool:
-        """Прочитать accept-подтверждение set-подкоманды внутри открытой сессии.
+    def _read_accept(self) -> bool:
+        """Прочитать accept-подтверждение set-подкоманды (под блокировкой).
 
         True — устройство подтвердило команду (кадр с заголовком [0x55,0x22]);
-        False — ответа нет или кадр не распознан.
+        False — ответа нет или кадр не распознан. Кадр разбирается в кэш.
         """
         frame = self._transport.read_report(DRAIN_TIMEOUT_MS)
         if frame is None:
             return False
+        self._ingest(frame)
         return (
             protocol.parse_settings_response(
                 _strip_report_id(frame, protocol.HEADSET_FRAME_SIZE),
@@ -86,50 +169,51 @@ class HeadsetService:
         )
 
     def poll_battery(self) -> protocol.BatteryState | None:
-        """Батарея; None, если донгл/наушники не ответили."""
+        """Свежая батарея; без ответа — последний известный статус из кэша."""
         frame = self._query(protocol.build_battery_query())
-        if frame is None:
-            return None
-        return protocol.parse_battery(frame)
+        if frame is not None:
+            state = protocol.parse_battery(frame)
+            if state is not None:
+                return state
+        return self.cached_battery()
 
     def poll_audio_mode(self) -> protocol.AudioMode | None:
-        """Режим звука; None, если ответа нет."""
+        """Свежий режим звука; без ответа — последний известный из кэша."""
         frame = self._query(protocol.build_audio_mode_query())
-        if frame is None:
-            return None
-        mode_raw = protocol.parse_audio_mode(frame)
-        if mode_raw is None:
-            return None
-        return protocol.AudioMode(mode_raw)
+        if frame is not None:
+            mode_raw = protocol.parse_audio_mode(frame)
+            if mode_raw is not None:
+                return protocol.AudioMode(mode_raw)
+        return self.cached_audio_mode()
 
-    def poll_status(self) -> tuple[protocol.BatteryState, protocol.AudioMode] | None:
-        """Батарея и режим звука; кортеж только если ОБА ответа успешны."""
+    def poll_status(
+        self,
+    ) -> tuple[protocol.BatteryState | None, protocol.AudioMode | None] | None:
+        """Батарея и режим из свежего опроса или кэша.
+
+        None — не известно ни то, ни другое (кэш пуст и опрос молчит).
+        """
         battery = self.poll_battery()
-        if battery is None:
-            return None
         mode = self.poll_audio_mode()
-        if mode is None:
+        if battery is None and mode is None:
             return None
         return battery, mode
 
     def set_audio_mode(self, mode: protocol.AudioMode) -> protocol.AudioMode | None:
         """Установить режим и прочитать фактический; None без ответа."""
         with self._lock:
-            self._transport.unlock_command_channel()
-            try:
-                self._transport.write_report(
-                    protocol.HEADSET_REPORT_ID, protocol.build_set_audio_mode(mode)
-                )
-                if self._settle_delay_s > 0:
-                    time.sleep(self._settle_delay_s)
-                self._transport.write_report(
-                    protocol.HEADSET_REPORT_ID, protocol.build_audio_mode_query()
-                )
-                frame = self._transport.read_report(self._read_timeout_ms)
-            finally:
-                self._transport.lock_command_channel()
+            self._transport.write_report(
+                protocol.HEADSET_REPORT_ID, protocol.build_set_audio_mode(mode)
+            )
+            if self._settle_delay_s > 0:
+                time.sleep(self._settle_delay_s)
+            self._transport.write_report(
+                protocol.HEADSET_REPORT_ID, protocol.build_audio_mode_query()
+            )
+            frame = self._transport.read_report(self._read_timeout_ms)
         if frame is None:
             return None
+        self._ingest(frame)
         mode_raw = protocol.parse_audio_mode(
             _strip_report_id(frame, protocol.HEADSET_FRAME_SIZE)
         )
@@ -148,32 +232,26 @@ class HeadsetService:
                 str(item) for item in sorted(protocol.AUTO_SHUTDOWN_MINUTES_TO_VALUE)
             )
             raise ValueError(f"автоотключение поддерживает только {supported} минут")
-        accepted = False
         with self._lock:
-            self._transport.unlock_command_channel()
-            try:
-                self._transport.write_report(
-                    protocol.HEADSET_REPORT_ID,
-                    protocol.build_settings(
-                        protocol.SETTINGS_SUB_SET_AUTO_SHUTDOWN, value
-                    ),
-                )
-                accepted = self._read_accept_locked()
-            finally:
-                self._transport.lock_command_channel()
+            self._transport.write_report(
+                protocol.HEADSET_REPORT_ID,
+                protocol.build_settings(protocol.SETTINGS_SUB_SET_AUTO_SHUTDOWN, value),
+            )
+            accepted = self._read_accept()
         return accepted
 
     def get_auto_shutdown(self) -> int | None:
-        """Текущее автоотключение в минутах."""
+        """Свежее автоотключение в минутах; без ответа — из кэша."""
         frame = self._query(
             protocol.build_settings(protocol.SETTINGS_SUB_READ_AUTO_SHUTDOWN)
         )
-        if frame is None:
-            return None
-        value = protocol.parse_settings_response(frame, expect_value=True)
-        if value is None:
-            return None
-        return protocol.auto_shutdown_value_to_minutes(value)
+        if frame is not None:
+            value = protocol.parse_settings_response(frame, expect_value=True)
+            if value is not None:
+                minutes = protocol.auto_shutdown_value_to_minutes(value)
+                if minutes is not None:
+                    return minutes
+        return self.cached_auto_shutdown()
 
     def set_prompt_volume(self, level: int) -> bool:
         """Громкость голосовых подсказок, 0..15.
@@ -184,29 +262,24 @@ class HeadsetService:
             raise ValueError(
                 f"громкость подсказок принимает значение 0..{protocol.PROMPT_VOLUME_MAX}"
             )
-        accepted = False
         with self._lock:
-            self._transport.unlock_command_channel()
-            try:
-                self._transport.write_report(
-                    protocol.HEADSET_REPORT_ID,
-                    protocol.build_settings(
-                        protocol.SETTINGS_SUB_SET_PROMPT_VOLUME, level
-                    ),
-                )
-                accepted = self._read_accept_locked()
-            finally:
-                self._transport.lock_command_channel()
+            self._transport.write_report(
+                protocol.HEADSET_REPORT_ID,
+                protocol.build_settings(protocol.SETTINGS_SUB_SET_PROMPT_VOLUME, level),
+            )
+            accepted = self._read_accept()
         return accepted
 
     def get_prompt_volume(self) -> int | None:
-        """Текущая громкость подсказок."""
+        """Свежая громкость подсказок; без ответа — из кэша."""
         frame = self._query(
             protocol.build_settings(protocol.SETTINGS_SUB_READ_PROMPT_VOLUME)
         )
-        if frame is None:
-            return None
-        return protocol.parse_settings_response(frame, expect_value=True)
+        if frame is not None:
+            value = protocol.parse_settings_response(frame, expect_value=True)
+            if value is not None:
+                return value
+        return self.cached_prompt_volume()
 
     def factory_reset(self) -> bool:
         """Сброс настроек наушников; accept-кадр потребляется внутри сессии.
@@ -214,17 +287,12 @@ class HeadsetService:
         True — устройство подтвердило сброс; False — подтверждения нет
         (наушники не ответили или кадр не распознан).
         """
-        accepted = False
         with self._lock:
-            self._transport.unlock_command_channel()
-            try:
-                self._transport.write_report(
-                    protocol.HEADSET_REPORT_ID,
-                    protocol.build_settings(protocol.SETTINGS_SUB_FACTORY_RESET),
-                )
-                accepted = self._read_accept_locked()
-            finally:
-                self._transport.lock_command_channel()
+            self._transport.write_report(
+                protocol.HEADSET_REPORT_ID,
+                protocol.build_settings(protocol.SETTINGS_SUB_FACTORY_RESET),
+            )
+            accepted = self._read_accept()
         return accepted
 
 

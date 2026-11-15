@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import threading
+import time
+
 import pytest
 from conftest import FakeTransport
 
@@ -61,10 +64,15 @@ def test_poll_status_battery_timeout(fake_transport: FakeTransport) -> None:
 
 
 def test_poll_status_mode_timeout(fake_transport: FakeTransport) -> None:
+    """Батарея ответила, режим молчит: (батарея, None), а не None целиком."""
     fake_transport.queue_response(
         headset_frame(proto.HEADSET_REPORT_ID, 0x65, 50, proto.BATTERY_STATUS_DISCHARGE)
     )
-    assert HeadsetService(fake_transport, settle_delay_s=0.0).poll_status() is None
+    battery, mode = HeadsetService(fake_transport, settle_delay_s=0.0).poll_status()
+    assert battery == proto.BatteryState(
+        percent=50, charging=False, full=False, asleep=False
+    )
+    assert mode is None
 
 
 def test_poll_battery_and_mode_split(fake_transport: FakeTransport) -> None:
@@ -77,7 +85,11 @@ def test_poll_battery_and_mode_split(fake_transport: FakeTransport) -> None:
         percent=64, charging=False, full=True, asleep=False
     )
     assert service.poll_audio_mode() is None
-    assert service.poll_status() is None
+    battery, mode = service.poll_status()
+    assert (battery, mode) == (
+        proto.BatteryState(percent=64, charging=False, full=True, asleep=False),
+        None,
+    )
 
 
 def test_poll_audio_mode_only(fake_transport: FakeTransport) -> None:
@@ -88,7 +100,8 @@ def test_poll_audio_mode_only(fake_transport: FakeTransport) -> None:
     service = HeadsetService(fake_transport, settle_delay_s=0.0)
     assert service.poll_audio_mode() == proto.AudioMode.MUSIC
     assert service.poll_battery() is None
-    assert service.poll_status() is None
+    battery, mode = service.poll_status()
+    assert (battery, mode) == (None, proto.AudioMode.MUSIC)
 
 
 def test_poll_battery_timeout(fake_transport: FakeTransport) -> None:
@@ -165,7 +178,7 @@ def test_prompt_volume_invalid(fake_transport: FakeTransport, level: int) -> Non
 
 
 def test_factory_reset_consumes_accept(fake_transport: FakeTransport) -> None:
-    """factory_reset в сессии канала: unlock -> write -> read(accept) -> lock."""
+    """factory_reset: write -> read(accept); канал открывает транспорт."""
     fake_transport.queue_response(headset_frame(0x55, 0x22, 0))
     assert HeadsetService(fake_transport).factory_reset() is True
     assert fake_transport.written == [
@@ -175,11 +188,11 @@ def test_factory_reset_consumes_accept(fake_transport: FakeTransport) -> None:
         )
     ]
     assert fake_transport.reads == [DRAIN_TIMEOUT_MS]
-    assert fake_transport.events == ["unlock", "write", "read", "lock"]
+    assert fake_transport.events == ["write", "read"]
 
 
 def test_command_session_order(fake_transport: FakeTransport) -> None:
-    """Каждая команда наушников: unlock -> write -> read -> lock (§7)."""
+    """Команда наушников: write -> read; канал открывает транспорт (§7)."""
     fake_transport.queue_response(
         headset_frame(proto.HEADSET_REPORT_ID, 0x65, 66, proto.BATTERY_STATUS_DISCHARGE)
     )
@@ -188,15 +201,12 @@ def test_command_session_order(fake_transport: FakeTransport) -> None:
     assert state == proto.BatteryState(
         percent=66, charging=False, full=False, asleep=False
     )
-    assert fake_transport.events == ["unlock", "write", "read", "lock"]
-    assert fake_transport.features == [
-        (proto.FEATURE_AA_REPORT_ID, proto.build_channel_open()),
-        (proto.FEATURE_AA_REPORT_ID, proto.build_channel_close()),
-    ]
+    assert fake_transport.events == ["write", "read"]
+    assert fake_transport.features == []  # канал открывает транспорт, не команды
 
 
-def test_session_locks_on_transport_error(fake_transport: FakeTransport) -> None:
-    """ETIMEDOUT записи пробрасывается, но LOCK выполняется (finally)."""
+def test_session_propagates_write_error(fake_transport: FakeTransport) -> None:
+    """ETIMEDOUT записи пробрасывается наружу (lock-обёртки больше нет)."""
     service = HeadsetService(fake_transport, settle_delay_s=0.0)
 
     def stalled_write(report_id: int, payload: bytes) -> int:
@@ -210,53 +220,7 @@ def test_session_locks_on_transport_error(fake_transport: FakeTransport) -> None
     fake_transport.write_report = stalled_write  # type: ignore[method-assign]
     with pytest.raises(TransportError):
         service.poll_battery()
-    assert fake_transport.events == ["unlock", "write", "lock"]
-
-
-def test_query_keeps_original_error_over_lock_error(
-    fake_transport: FakeTransport,
-) -> None:
-    """Ошибка LOCK на отравленном транспорте не вытесняет исходную с подсказкой."""
-
-    def poisoned_write(report_id: int, payload: bytes) -> int:
-        fake_transport.events.append("write")
-        raise TransportError(
-            "ошибка записи: канал управления спит после простоя",
-            "включите звук через наушники, затем передёрните донгл",
-        )
-
-    def poisoned_lock() -> None:
-        fake_transport.events.append("lock")
-        raise TransportError("транспорт отравлен незавершённой записью")
-
-    fake_transport.write_report = poisoned_write  # type: ignore[method-assign]
-    fake_transport.lock_command_channel = poisoned_lock  # type: ignore[method-assign]
-    service = HeadsetService(fake_transport, settle_delay_s=0.0)
-    with pytest.raises(TransportError) as excinfo:
-        service.poll_battery()
-    assert "спит после простоя" in excinfo.value.message
-    assert "передёрните донгл" in excinfo.value.hint
-    assert "отравлен" not in excinfo.value.message
-    assert fake_transport.events == ["unlock", "write", "lock"]
-
-
-def test_query_propagates_lock_error_when_write_ok(
-    fake_transport: FakeTransport,
-) -> None:
-    """Запись успешна, LOCK не прошёл: наружу именно ошибка LOCK."""
-
-    def failing_lock() -> None:
-        fake_transport.events.append("lock")
-        raise TransportError("LOCK не принят донглом")
-
-    fake_transport.lock_command_channel = failing_lock  # type: ignore[method-assign]
-    fake_transport.queue_response(
-        headset_frame(proto.HEADSET_REPORT_ID, 0x65, 66, proto.BATTERY_STATUS_DISCHARGE)
-    )
-    service = HeadsetService(fake_transport, settle_delay_s=0.0)
-    with pytest.raises(TransportError, match="LOCK не принят"):
-        service.poll_battery()
-    assert fake_transport.events == ["unlock", "write", "read", "lock"]
+    assert fake_transport.events == ["write"]
 
 
 def test_set_audio_mode_session_order(fake_transport: FakeTransport) -> None:
@@ -266,17 +230,8 @@ def test_set_audio_mode_session_order(fake_transport: FakeTransport) -> None:
     )
     service = HeadsetService(fake_transport, settle_delay_s=0.0)
     assert service.set_audio_mode(proto.AudioMode.GAME_1) == proto.AudioMode.GAME_1
-    assert fake_transport.events == [
-        "unlock",
-        "write",
-        "write",
-        "read",
-        "lock",
-    ]
-    assert fake_transport.features == [
-        (proto.FEATURE_AA_REPORT_ID, proto.build_channel_open()),
-        (proto.FEATURE_AA_REPORT_ID, proto.build_channel_close()),
-    ]
+    assert fake_transport.events == ["write", "write", "read"]
+    assert fake_transport.features == []  # канал открывает транспорт, не команды
 
 
 def test_dock_set_light_switch_frame(fake_transport: FakeTransport) -> None:
@@ -429,3 +384,211 @@ def test_dock_setters_use_expected_commands(fake_transport: FakeTransport) -> No
     assert all(
         report_id == proto.DOCK_REPORT_ID for report_id, _ in fake_transport.written
     )
+
+
+# --- Регрессия двойного reportId: точные байты на проводе (как в usbmon) ---
+# Баг 0.3.0: строители клали reportId в payload, транспорт добавлял ещё раз —
+# на проводе уходило «55 55 65 …» / «aa aa 01 …» вместо эталона Windows
+# «55 65 …» / «aa 01 …». FakeTransport.wire фиксирует bytes([id]) + payload.
+
+
+def _pad64(*head: int) -> bytes:
+    """Кадр на проводе: header + нулевой паддинг до 64 байт."""
+    return bytes(head) + bytes(64 - len(head))
+
+
+def test_wire_battery_session_exact_bytes(fake_transport: FakeTransport) -> None:
+    """Сессия опроса батареи: aa 01 01 / 55 65 01 / aa 01 00, все по 64 байта."""
+    fake_transport.queue_response(
+        headset_frame(0x55, 0x65, 87, proto.BATTERY_STATUS_CHARGING)
+    )
+    state = HeadsetService(fake_transport, settle_delay_s=0.0).poll_battery()
+    assert state is not None
+    assert fake_transport.wire == [
+        _pad64(
+            0x55, 0x65, 0x01
+        ),  # запрос батареи — ID один раз; канал открыт транспортом
+    ]
+    assert all(len(frame) == 64 for frame in fake_transport.wire)
+    assert not [
+        f for f in fake_transport.wire if f[0] == 0xAA
+    ]  # 0xAA на провод не уходит
+
+
+def test_wire_audio_mode_exact_bytes(fake_transport: FakeTransport) -> None:
+    """Установка режима: 55 21 01 <mode> и запрос 55 11 — без дубля ID."""
+    fake_transport.queue_response(headset_frame(0x55, 0x11, int(proto.AudioMode.MUSIC)))
+    mode = HeadsetService(fake_transport, settle_delay_s=0.0).set_audio_mode(
+        proto.AudioMode.MUSIC
+    )
+    assert mode == proto.AudioMode.MUSIC
+    assert fake_transport.wire == [
+        _pad64(0x55, 0x21, 0x01, int(proto.AudioMode.MUSIC)),
+        _pad64(0x55, 0x11),
+    ]
+
+
+def test_wire_settings_exact_bytes(fake_transport: FakeTransport) -> None:
+    """set-подкоманда настроек: 55 22 <sub> <val> — ID ровно один."""
+    fake_transport.queue_response(headset_frame(0x55, 0x22, 0))
+    assert HeadsetService(fake_transport, settle_delay_s=0.0).set_auto_shutdown(30)
+    assert fake_transport.wire == [
+        _pad64(0x55, 0x22, 0x00, 0x04),  # sub 0: 30 мин -> value 4
+    ]
+
+
+def test_wire_dock_bytes_unchanged(fake_transport: FakeTransport) -> None:
+    """Путь дока не задет фиксом: 0x00 + кадр с START 0xAA, байты как были."""
+    DockService(fake_transport).set_light_switch(True)
+    DockService(fake_transport).read_global_info()
+    assert fake_transport.wire == [
+        _pad64(0x00, 0xAA, proto.DOCK_CMD_SET_LIGHT_SWITCH, 0, 0, 0, 1, 1),
+        _pad64(0x00, 0xAA, proto.DOCK_CMD_READ_GLOBAL_INFO, 0, 0, 0, 0),
+    ]
+
+
+# --- Пассивный приём: push-кадры донгла обновляют кэш (захват M HUB) ---
+
+
+def _push(*body: int) -> bytes:
+    """Пуш-кадр вида hidraw-чтения: reportId + payload, 64 байта."""
+    return headset_frame(*body)
+
+
+def test_passive_pushes_update_cache(fake_transport: FakeTransport) -> None:
+    """Пуш-кадры из захвата: 55 11 02 / 55 22 04 0a / 55 65 64 02 / 55 22 02 00."""
+    fake_transport.queue_response(_push(0x55, 0x11, 0x02))
+    fake_transport.queue_response(_push(0x55, 0x22, 0x04, 0x0A))
+    fake_transport.queue_response(_push(0x55, 0x65, 0x64, 0x02))
+    fake_transport.queue_response(_push(0x55, 0x22, 0x02, 0x00))
+    service = HeadsetService(fake_transport, settle_delay_s=0.0)
+    assert service.pump_passive() == 4
+    assert service.cached_audio_mode() == proto.AudioMode.MUSIC
+    assert service.cached_battery() == proto.BatteryState(
+        percent=100, charging=False, full=False, asleep=False
+    )
+    assert service.cached_prompt_volume() == 10
+    assert service.cached_auto_shutdown() == 45  # value 0 -> 45 минут
+    assert fake_transport.written == []  # приём пассивный: записей нет
+    assert fake_transport.reads == [10, 0, 0, 0, 0]  # 4 кадра + финальный drain-тик
+
+
+def test_poll_falls_back_to_cache(fake_transport: FakeTransport) -> None:
+    """Нет ответа на явный запрос — GUI-методы отдают последнее из кэша."""
+    fake_transport.queue_response(_push(0x55, 0x65, 0x50, proto.BATTERY_STATUS_FULL))
+    fake_transport.queue_response(_push(0x55, 0x11, int(proto.AudioMode.GAME_2)))
+    service = HeadsetService(fake_transport, settle_delay_s=0.0)
+    service.pump_passive()
+    # ответы кончились: явные запросы молчат
+    assert service.poll_battery() == proto.BatteryState(
+        percent=80, charging=False, full=True, asleep=False
+    )
+    assert service.poll_audio_mode() == proto.AudioMode.GAME_2
+    battery, mode = service.poll_status()
+    assert (battery, mode) == (
+        proto.BatteryState(percent=80, charging=False, full=True, asleep=False),
+        proto.AudioMode.GAME_2,
+    )
+
+
+def test_poll_status_none_when_cache_empty(fake_transport: FakeTransport) -> None:
+    """Кэш пуст и опрос молчит — poll_status None (как раньше)."""
+    assert HeadsetService(fake_transport, settle_delay_s=0.0).poll_status() is None
+
+
+def test_query_ingests_push_frame_while_waiting(fake_transport: FakeTransport) -> None:
+    """Пуш вместо ответа: кэш обновился, poll вернул кэш режима."""
+    fake_transport.queue_response(
+        _push(0x55, 0x65, 0x2D, proto.BATTERY_STATUS_CHARGING)
+    )
+    service = HeadsetService(fake_transport, settle_delay_s=0.0)
+    assert service.poll_audio_mode() is None  # кадр не про режим, кэша нет
+    assert service.cached_battery() == proto.BatteryState(
+        percent=45, charging=True, full=False, asleep=False
+    )
+
+
+def test_push_of_unknown_command_ignored(fake_transport: FakeTransport) -> None:
+    """Пуш чужой команды (66 65 ...) кэш не трогает."""
+    fake_transport.queue_response(_push(0x66, 0x65, 99, 2))
+    service = HeadsetService(fake_transport, settle_delay_s=0.0)
+    assert service.pump_passive() == 1
+    assert service.cached_battery() is None
+
+
+# --- pump_passive держит блокировку сервиса (не крадёт ответ команды) ---
+
+
+def test_pump_passive_holds_lock_against_command(
+    fake_transport: FakeTransport,
+) -> None:
+    """Команда и pump_passive одновременно: команда получает СВОЙ ответ.
+
+    pump «висит внутри чтения» (slow_read), команда стартует и ждёт
+    на сервисной блокировке: пока lock удержан, записи команды нет;
+    после отпускания команда уходит первой и читает свой ответ.
+    """
+    service = HeadsetService(fake_transport, settle_delay_s=0.0)
+    entered = threading.Event()
+    release = threading.Event()
+    original_read = fake_transport.read_report
+    calls = {"n": 0}
+
+    def slow_read(timeout_ms: int) -> bytes | None:
+        calls["n"] += 1
+        if calls["n"] > 1:
+            return original_read(timeout_ms)  # чтению команды — честный FIFO
+        entered.set()
+        release.wait(5)  # pump «читает» — всё это время lock удержан
+        return None  # кадр команде не отдаём: он ждёт её чтение
+
+    fake_transport.read_report = slow_read  # type: ignore[method-assign]
+
+    pump = threading.Thread(target=lambda: service.pump_passive(timeout_ms=50))
+    pump.start()
+    assert entered.wait(2)  # pump внутри чтения
+
+    answers: list[proto.BatteryState | None] = []
+
+    def command() -> None:
+        answers.append(service.poll_battery())
+
+    cmd = threading.Thread(target=command)
+    cmd.start()
+    time.sleep(0.15)  # команда дошла до сервисной блокировки и ждёт
+    # Пока lock удержан pump'ом: команда не сделала ни записи, ни чтения.
+    assert fake_transport.written == []
+    assert fake_transport.reads == []
+
+    fake_transport.queue_response(
+        headset_frame(proto.HEADSET_REPORT_ID, 0x65, 66, proto.BATTERY_STATUS_DISCHARGE)
+    )
+    release.set()
+    pump.join(5)
+    cmd.join(5)
+
+    assert answers == [
+        proto.BatteryState(percent=66, charging=False, full=False, asleep=False)
+    ]
+    # Порядок: чтение pump (в lock, через хук) -> write -> read команды.
+    assert fake_transport.events == ["write", "read"]
+    assert fake_transport.reads == [800]  # чтение команды со своим таймаутом
+
+
+# --- frames_received: признак живого канала для GUI ---
+
+
+def test_frames_received_counts_answers_and_pushes(
+    fake_transport: FakeTransport,
+) -> None:
+    """Счётчик растёт и от пушей (pump), и от свежих ответов (запрос)."""
+    fake_transport.queue_response(headset_frame(0x55, 0x11, 0x02))  # пуш режима
+    service = HeadsetService(fake_transport, settle_delay_s=0.0)
+    assert service.frames_received() == 0
+    assert service.pump_passive() == 1
+    assert service.frames_received() == 1
+    fake_transport.queue_response(
+        headset_frame(proto.HEADSET_REPORT_ID, 0x65, 66, proto.BATTERY_STATUS_DISCHARGE)
+    )
+    service.poll_battery()  # свежий ответ на явный запрос
+    assert service.frames_received() == 2

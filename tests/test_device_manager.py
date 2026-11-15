@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import sys
 import threading
 from pathlib import Path
@@ -148,3 +149,81 @@ def test_command_session_unknown_device() -> None:
         pass
     else:  # pragma: no cover — контракт нарушен
         raise AssertionError("ожидался ValueError для неизвестного устройства")
+
+
+# --- close() выведенных транспортов вне блокировки менеджера (находка ревью) ---
+
+
+def test_discover_closes_stale_transport_outside_lock(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """Блокирующий close() старого транспорта не держит блокировку менеджера."""
+    from mchose_hub.gui import app as app_module
+
+    started = threading.Event()
+    release = threading.Event()
+
+    class _WedgedClose:
+        path = "/dev/wedge"
+
+        def close(self) -> None:
+            started.set()
+            release.wait(5)  # close() висит: LOCK-ioctl залип на устройстве
+
+    wedge = _WedgedClose()
+    dongles = iter([wedge, None])  # второй скан: донгл уже выдернут
+    monkeypatch.setattr(app_module, "find_dongle", lambda: next(dongles, None))
+    monkeypatch.setattr(app_module, "find_dock", lambda: None)
+    monkeypatch.setattr(app_module, "scan_hidraw", list)
+    manager = DeviceManager()
+    manager.discover()
+
+    snapshots: list[ManagerSnapshot] = []
+    worker = threading.Thread(target=lambda: snapshots.append(manager.discover()))
+    worker.start()
+    assert started.wait(2)  # close() wedge выполняется в чужом потоке
+    # Пока он висит, блокировка менеджера свободна: command_session берётся.
+    with manager._lock:
+        acquired = True
+    assert acquired
+    release.set()
+    worker.join(5)
+    assert snapshots == [ManagerSnapshot()]  # донгл больше не найден
+
+
+# --- EIO = отключение: авто-ретрай пере-сканирует на новый узел ---
+
+
+def test_eio_recovery_moves_to_new_node(monkeypatch: MonkeyPatch) -> None:
+    """EIO помечает транспорт отключённым: ретрай открывает донгл на новом узле."""
+    from mchose_hub import transport as transport_module
+    from mchose_hub.gui.helpers import with_transport_retry
+
+    # Тот же TransportError, что строит транспорт для EIO при чтении.
+    error = transport_module._data_oserror(
+        "/dev/hidraw1", "чтения", OSError(errno.EIO, "Ошибка ввода/вывода")
+    )
+    assert "устройство отключено" not in error.message
+    assert "донгл будет найден заново" in error.message
+
+    dead = FakeTransport()
+
+    def dead_read(timeout_ms: int) -> bytes | None:
+        raise error
+
+    dead.read_report = dead_read  # type: ignore[method-assign]
+    alive = FakeTransport()
+    _patch_discovery(monkeypatch, [dead, alive])
+    manager = DeviceManager()
+    manager.discover()
+    assert not dead.closed
+
+    def pump_tick() -> int:
+        with manager.command_session("headset") as service:
+            assert service is not None
+            return service.pump_passive()
+
+    assert with_transport_retry(pump_tick, manager.discover)() == 0
+    assert dead.closed  # старый узел закрыт при пере-скане
+    assert not alive.closed  # работа продолжилась на новом транспорте
+    assert manager.snapshot.dongle_path == alive.path

@@ -167,11 +167,11 @@ class HeadsetTab(QWidget):
             self._battery_caption.setText(_NO_LINK)
             _mark_active(self._mode_buttons, -1)
 
-    def apply_battery(self, battery: BatteryState) -> None:
-        """Батарея из poll_battery(); вызывается даже при молчащем режиме."""
+    def apply_battery(self, battery: BatteryState, note: str = "") -> None:
+        """Батарея из poll_battery()/кэша; note — пометка давности кэша."""
         self._battery_value.setText(f"{battery.percent}%")
         self._battery_value.setStyleSheet(f"color: {battery_color(battery.percent)};")
-        self._battery_caption.setText(battery_caption(battery))
+        self._battery_caption.setText(battery_caption(battery) + note)
 
     def apply_mode(self, mode: AudioMode) -> None:
         """Режим звука из poll_audio_mode()/read-back."""

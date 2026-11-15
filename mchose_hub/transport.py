@@ -13,6 +13,7 @@ import os
 import queue
 import select
 import threading
+from collections.abc import Callable
 from concurrent.futures import Future
 from dataclasses import dataclass
 from typing import Protocol
@@ -35,7 +36,7 @@ _REPORT_MAX_SIZE = 64
 WRITE_TIMEOUT_S = 2.0
 # Дополнительное ожидание исхода уже поданной записи (2 + 4 = до 6 c суммарно,
 # с запасом перекрывает 5-секундный ядерный таймаут): к моменту выхода из
-# write_report исход записи всегда разрешён — LOCK сессии уходит после него.
+# write_report исход записи всегда разрешён (успех/ошибка/не разрешена).
 WRITE_GRACE_S = 4.0
 # Бюджет ожидания застрявшей записи при close(): сверх него транспорт
 # отравляется, fd сознательно не закрывается (утечка одного fd вместо
@@ -47,16 +48,17 @@ UDEV_HINT = (
     "установите правила из packaging/99-mchose-hub.rules в /etc/udev/rules.d/ "
     "и выполните: sudo udevadm control --reload && sudo udevadm trigger"
 )
-# Донгл сторждит interrupt OUT, когда наушники вне 2.4G-линка или спят
-# (ETIMEDOUT на os.write / SET_FEATURE) — PROTOCOL.md §7.
+# Таймаут записи/чтения (ETIMEDOUT на os.write / SET_FEATURE): причина
+# тишины — выключенные или далеко ушедшие наушники, канал донгла ни при чём.
 ETIMEDOUT_HEADSET_HINT = (
-    "канал управления спит после простоя: включите звук через наушники, "
-    "затем передёрните донгл (выньте и вставьте) — приложение подхватит "
-    "автоматически"
+    "наушники не отвечают: проверьте, что они включены и находятся рядом с донглом"
 )
-# ENODEV (Errno 19): узел hidraw пере-перечислился (донгл передёрнули,
+# ENODEV (Errno 19): узел hidraw пере-перечислился (донгл вынули и вставили,
 # udev пересоздал устройство) — старый fd мёртв, но устройство живо под
 # новым номером: лечится пере-сканом (gui.helpers.is_recoverable_transport).
+# EIO (Errno 5) на операциях данных (os.read/os.write) — тот же случай,
+# проверено на живом железе: донгл вынули, старый fd даёт «Ошибка
+# ввода/вывода». EIO на feature-ioctl — обычная ошибка.
 ENODEV_RESCAN_HINT = (
     "устройство пере-перечислилось: приложение выполнит пере-скан hidraw "
     "и подключится автоматически"
@@ -93,19 +95,35 @@ class TransportError(Exception):
 
 
 def _transport_oserror(path: str, action: str, exc: OSError) -> TransportError:
-    """OSError → TransportError; ENODEV получает общий маркер отключения.
+    """OSError → TransportError; ENODEV получает маркер пере-перечисления.
 
-    Errno 19 означает, что узел hidraw пере-перечислился: старый fd мёртв,
-    но устройство может жить под новым номером — лечится пере-сканом.
-    Сообщение «{path}: устройство отключено (переподключено)» содержит
-    префикс «устройство отключено», который матчит
-    is_recoverable_transport в gui.helpers (наряду с EOF).
+    Errno 19 — узел hidraw пере-перечислился: старый fd мёртв, но
+    устройство может жить под новым номером — лечится пере-сканом.
+    Сообщение «{path}: устройство отключено (переподключено)» матчит
+    is_recoverable_transport в gui.helpers (наряду с EOF). EIO здесь
+    НЕ восстановимый: ioctl feature-канала — не признак отключения.
     """
     if exc.errno == errno.ENODEV:
         return TransportError(
             f"{path}: устройство отключено (переподключено)", _error_hint(exc)
         )
     return TransportError(f"ошибка {action} {path}: {exc}", _error_hint(exc))
+
+
+def _data_oserror(path: str, action: str, exc: OSError) -> TransportError:
+    """OSError операций данных (os.read/os.write): EIO — отключение донгла.
+
+    EIO (Errno 5, проверено на живом железе): донгл вынули, чтение/запись
+    старого fd падают «ошибкой ввода/вывода», узел живёт под новым номером.
+    Исходная операция и errno сохраняются в сообщении, маркер «донгл будет
+    найден заново» матчится is_recoverable_transport → авто-пере-скан.
+    """
+    if exc.errno == errno.EIO:
+        return TransportError(
+            f"ошибка {action} {path}: {exc}; донгл будет найден заново",
+            ENODEV_RESCAN_HINT,
+        )
+    return _transport_oserror(path, action, exc)
 
 
 class HidTransport(Protocol):
@@ -145,11 +163,17 @@ class HidTransport(Protocol):
 
 @dataclass
 class _WriteTask:
-    """Задача очереди писателя: wire-кадр и future для результата."""
+    """Задача очереди писателя: wire-кадр и future для результата.
+
+    action вместо wire — произвольная работа в потоке-писателе (close()
+    так отправляет LOCK канала + закрытие fd, чтобы блокирующий ioctl
+    не задерживал вызывающего дольше бюджета).
+    """
 
     fd: int
     wire: bytes
     result: Future[int]
+    action: Callable[[], int] | None = None
 
 
 class HidrawTransport:
@@ -164,12 +188,18 @@ class HidrawTransport:
         self,
         dev_path: str,
         *,
+        manage_channel: bool = False,
         write_timeout_s: float = WRITE_TIMEOUT_S,
         write_grace_s: float = WRITE_GRACE_S,
         close_grace_s: float = CLOSE_GRACE_S,
     ) -> None:
         self.path = dev_path
         self._lock = threading.Lock()
+        # Лёгкая блокировка состояния close(): только check-and-set флага,
+        # никогда не держится во время ioctl (в отличие от self._lock,
+        # который поток-писатель держит внутри _lock_and_close).
+        self._state_lock = threading.Lock()
+        self._manage_channel = manage_channel
         self._write_timeout_s = write_timeout_s
         self._write_grace_s = write_grace_s
         self._close_grace_s = close_grace_s
@@ -194,6 +224,21 @@ class HidrawTransport:
                     ENODEV_RESCAN_HINT,
                 ) from exc
             raise TransportError(f"не удалось открыть {dev_path}: {exc}") from exc
+        if manage_channel:
+            # Командный канал донгла открывается ОДИН раз при открытии
+            # транспорта (эталон M HUB: 3 часа — одна пара unlock/lock на
+            # подключение), а не вокруг каждой команды (PROTOCOL.md §7).
+            # Пере-перечисление при восстановлении создаёт новый транспорт —
+            # канал открывается заново.
+            try:
+                self.unlock_command_channel()
+            except BaseException:
+                # Объект не создан — fd не оставляем открытым: иначе каждая
+                # неудача UNLOCK (недоступный/мёртвый донгл) течёт дескриптором.
+                with self._lock:
+                    os.close(self._fd)
+                    self._fd = -1
+                raise
 
     def _ensure_alive(self) -> None:
         """Отравленный транспорт не обслуживает операции (fd сознательно не закрыт)."""
@@ -210,8 +255,7 @@ class HidrawTransport:
         ожидание ограничено write_timeout_s; по истечении бюджета исход
         записи дожидается ещё write_grace_s: write_report возвращает
         управление только когда судьба данных известна (успех / ошибка /
-        не разрешена), поэтому LOCK в finally сессии всегда уходит после
-        финала записи. Запись, не разрешённая даже за grace, отравляет
+        не разрешена). Запись, не разрешённая даже за grace, отравляет
         транспорт (все дальнейшие операции дают TransportError).
         """
         wire = bytes([report_id]) + payload
@@ -229,16 +273,16 @@ class HidrawTransport:
                 ) from None
             if isinstance(outcome, Exception):
                 if isinstance(outcome, OSError):
-                    raise _transport_oserror(
-                        self.path, "записи в", outcome
-                    ) from outcome
+                    # Тот же маппинг, что у немедленной ошибки записи:
+                    # EIO (донгл вынули) — восстановимая, как ENODEV.
+                    raise _data_oserror(self.path, "записи в", outcome) from outcome
                 raise TransportError(f"ошибка записи в {self.path}: {outcome}")
             raise TransportError(
                 f"запись в {self.path} не подтверждена: данные могли дойти",
                 ETIMEDOUT_HEADSET_HINT,
             )
         except OSError as exc:
-            raise _transport_oserror(self.path, "записи в", exc) from exc
+            raise _data_oserror(self.path, "записи в", exc) from exc
 
     def _await_write_outcome(self, future: Future[int]) -> int | Exception | None:
         """Дождаться исхода записи в пределах grace; None — не завершилась."""
@@ -270,6 +314,27 @@ class HidrawTransport:
             self._last_write = future
             return future
 
+    def _submit_work(self, work: Callable[[], int]) -> Future[int]:
+        """Отправить произвольную работу в поток-писатель (используется close()).
+
+        В отличие от _submit_write не проверяет _closing/_poisoned: вызывается
+        самим close(), когда новые записи уже отвергнуты. Гарантирует живого
+        писателя (перезапускает поток при надобности).
+        """
+        with self._lock:
+            if self._writer is None or not self._writer.is_alive():
+                self._writer = threading.Thread(
+                    target=self._write_loop,
+                    name=f"hidraw-write-{self.path}",
+                    daemon=True,  # умирает вместе с процессом, не держит выход
+                )
+                self._writer.start()
+            future: Future[int] = Future()
+            self._queue.put(
+                _WriteTask(fd=self._fd, wire=b"", result=future, action=work)
+            )
+            return future
+
     def _write_loop(self) -> None:
         """Цикл писателя: задачи из очереди до стоп-токена (None).
 
@@ -282,7 +347,11 @@ class HidrawTransport:
             if task is None:
                 return
             try:
-                task.result.set_result(os.write(task.fd, task.wire))
+                if task.action is not None:
+                    outcome = task.action()
+                else:
+                    outcome = os.write(task.fd, task.wire)
+                task.result.set_result(outcome)
             except Exception as exc:  # noqa: BLE001 — исход уходит ждущему
                 task.result.set_exception(exc)
 
@@ -301,7 +370,7 @@ class HidrawTransport:
             except BlockingIOError:
                 return None
             except OSError as exc:
-                raise _transport_oserror(self.path, "чтения", exc) from exc
+                raise _data_oserror(self.path, "чтения", exc) from exc
             if not chunk:
                 raise TransportError(f"{self.path}: устройство отключено (EOF)")
             return chunk
@@ -345,7 +414,11 @@ class HidrawTransport:
         return bytes(buf[: max(count, 0)])
 
     def unlock_command_channel(self) -> None:
-        """UNLOCK командного канала: SET_FEATURE(0xAA) = [0xAA,0x01,0x01]."""
+        """UNLOCK командного канала: SET_FEATURE(0xAA) = [0xAA,0x01,0x01].
+
+        При manage_channel=True выполняется самим транспортом один раз
+        после открытия; отдельные команды не оборачиваются (PROTOCOL.md §7).
+        """
         self.send_feature(FEATURE_AA_REPORT_ID, build_channel_open())
 
     def lock_command_channel(self) -> None:
@@ -353,43 +426,75 @@ class HidrawTransport:
         self.send_feature(FEATURE_AA_REPORT_ID, build_channel_close())
 
     def close(self) -> None:
-        """Закрыть дескриптор (идемпотентно), ограничив ожидание записи.
+        """Закрыть дескриптор (строго однократно), ограничив ожидания.
 
-        С момента вызова транспорт помечен закрывающимся (флаг под
-        блокировкой): _submit_write отвергает новые записи — дренирование
-        полно, все задачи, принятые до close, дожидаются исхода в пределах
-        close_grace_s. Если запись не завершилась за grace — транспорт
-        отравляется, fd сознательно НЕ закрывается (утечка одного fd лучше
-        неограниченной блокировки выхода и лучше записи в чужой fd,
-        переиспользовавший номер). Писатель — daemon-поток: close его НЕ
-        ждёт, поток умирает вместе с процессом. Детерминированный исход:
-        фоновая запись может завершиться после close в не-закрытый fd;
-        при выходе процесса daemon-поток прерывается ядром — процесс
-        завершается всегда.
+        Флаг _closing проверяется и выставляется под лёгкой _state_lock:
+        повторный close() сразу возвращает управление и не ставит вторую
+        задачу LOCK. Записи, принятые до close, дожидаются исхода в
+        пределах close_grace_s; не уложившаяся — отравляет транспорт, fd
+        сознательно НЕ закрывается (утечка одного fd лучше неограниченной
+        блокировки выхода и лучше записи в чужой fd).
+
+        LOCK командного канала (manage_channel=True) уходит в тот же
+        поток-писатель с бюджетом close_grace_s: блокирующий ioctl не
+        подвешивает close() (его ждёт DeviceManager, а с ним все воркеры).
+        fd закрывает сам писатель после ioctl — по успеху, ошибке или
+        после истечения бюджета (close() к тому моменту уже вернулся).
+
+        Писатель — daemon-поток: умирает вместе с процессом.
         """
-        if self._poisoned:
-            return  # отравлен: ждать нечего, fd остаётся незакрытым
+        with self._state_lock:
+            if self._closing or self._poisoned:
+                return  # уже закрывается/отравлен: вторую задачу LOCK не ставим
+            self._closing = True  # _submit_write отвергает новые записи
         with self._lock:
-            self._closing = True  # отвергнуть записи до конца дренирования
             last, self._last_write = self._last_write, None
-        drained = True
         if last is not None:
             try:
                 last.result(timeout=self._close_grace_s)
             except TimeoutError:
-                drained = False
+                self._poisoned = True
+                return  # daemon-писателя не ждём — умирает с процессом
             except Exception:  # noqa: BLE001, S110 — ошибка записи: исход известен
                 pass
-        if not drained:
-            self._poisoned = True
-            return  # daemon-писателя не ждём — умирает с процессом
+        if not self._manage_channel:
+            with self._lock:
+                if self._writer is not None and self._writer.is_alive():
+                    self._queue.put(None)  # стоп-токен: писатель завершится сам
+                self._writer = None
+                if self._fd >= 0:
+                    os.close(self._fd)
+                    self._fd = -1
+            return
+        # LOCK + закрытие fd — задачей в поток-писателя с бюджетом.
+        lock_future = self._submit_work(self._lock_and_close)
+        self._queue.put(None)  # стоп-токен после задачи: писатель завершится
+        try:
+            lock_future.result(timeout=self._close_grace_s)
+        except TimeoutError:
+            return  # ioctl ещё идёт: fd закроет писатель по завершении
+        except Exception:  # noqa: BLE001, S110 — исход задачи не важен: fd закрыт
+            pass
+
+    def _lock_and_close(self) -> int:
+        """LOCK канала и закрытие fd в потоке-писателе (выполняется с бюджетом).
+
+        LOCK — best effort: мёртвое устройство (ENODEV и т.п.) не мешает
+        close. fd закрывается здесь же: ждущий (close()) при истечении
+        бюджета больше не трогает дескриптор.
+        """
         with self._lock:
-            if self._writer is not None and self._writer.is_alive():
-                self._queue.put(None)  # стоп-токен: писатель завершится сам
-            self._writer = None
-            if self._fd >= 0:
-                os.close(self._fd)
-                self._fd = -1
+            fd = self._fd
+        if fd >= 0:
+            try:
+                self.lock_command_channel()
+            except TransportError:
+                pass
+            with self._lock:
+                if self._fd >= 0:
+                    os.close(self._fd)
+                    self._fd = -1
+        return 0
 
 
 def _parse_hid_id(value: str) -> tuple[int, int] | None:
@@ -427,11 +532,14 @@ def scan_hidraw() -> list[tuple[str, int, int]]:
     return devices
 
 
-def find_device(vid: int, pids: int | tuple[int, ...]) -> HidrawTransport | None:
+def find_device(
+    vid: int, pids: int | tuple[int, ...], *, manage_channel: bool = False
+) -> HidrawTransport | None:
     """Открыть первое устройство vid + один из pids.
 
     Нет совпадений -> None; открыть не удалось (права/отсутствие узла) ->
-    TransportError с подсказкой про udev.
+    TransportError с подсказкой про udev. manage_channel прокидывается в
+    транспорт (командный канал донгла; дока не касается).
     """
     wanted = (pids,) if isinstance(pids, int) else tuple(pids)
     last_error: TransportError | None = None
@@ -439,7 +547,7 @@ def find_device(vid: int, pids: int | tuple[int, ...]) -> HidrawTransport | None
         if dev_vid != vid or dev_pid not in wanted:
             continue
         try:
-            return HidrawTransport(path)
+            return HidrawTransport(path, manage_channel=manage_channel)
         except TransportError as exc:
             last_error = exc
     if last_error is not None:
@@ -448,8 +556,14 @@ def find_device(vid: int, pids: int | tuple[int, ...]) -> HidrawTransport | None
 
 
 def find_dongle() -> HidrawTransport | None:
-    """Донгл наушников: PID 600A (V9 Turbo+) или 600D (V9 Turbo)."""
-    return find_device(VID_MCHOSE, (PID_HEADSET_DONGLE, PID_HEADSET_WIRED))
+    """Донгл наушников: PID 600A (V9 Turbo+) или 600D (V9 Turbo).
+
+    Транспорт с manage_channel=True: командный канал открывается один раз
+    при подключении и пере-открывается при каждом восстановлении.
+    """
+    return find_device(
+        VID_MCHOSE, (PID_HEADSET_DONGLE, PID_HEADSET_WIRED), manage_channel=True
+    )
 
 
 def find_dock() -> HidrawTransport | None:

@@ -29,12 +29,15 @@ class FakeTransport:
         self.features: list[tuple[int, bytes]] = []
         self.events: list[str] = []
         self.closed = False
+        # Точные байты на проводе: bytes([reportId]) + payload — как их видит usbmon.
+        self.wire: list[bytes] = []
 
     def queue_response(self, frame: bytes) -> None:
         self.responses.append(frame)
 
     def write_report(self, report_id: int, payload: bytes) -> int:
         self.written.append((report_id, payload))
+        self.wire.append(bytes([report_id]) + payload)
         self.events.append("write")
         return len(payload) + 1
 
@@ -47,6 +50,7 @@ class FakeTransport:
 
     def send_feature(self, report_id: int, payload: bytes) -> int:
         self.features.append((report_id, payload))
+        self.wire.append(bytes([report_id]) + payload)
         return len(payload) + 1
 
     def get_feature(self, report_id: int, size: int) -> bytes:
