@@ -12,8 +12,10 @@ import threading
 from collections.abc import Iterator
 from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Literal, overload
 
+from PyQt6.QtCore import QLockFile
 from PyQt6.QtGui import QIcon
 from PyQt6.QtWidgets import QApplication
 
@@ -187,18 +189,42 @@ class DeviceManager:
             transport.close()
 
 
-def main() -> int:
-    """Точка входа GUI: QApplication, окно, цикл событий."""
-    app = QApplication(sys.argv)
-    app.setApplicationName(APP_TITLE)
-    app.setOrganizationName("mchose-hub")
-    app.setApplicationVersion("0.1.0")
-    app.setWindowIcon(QIcon(paint_battery_pixmap(100, charging=False, asleep=False)))
-    from .main_window import MainWindow  # локально: избегаем цикла импортов
+def try_acquire_single_instance() -> QLockFile | None:
+    """Single-instance guard: QLockFile в ~/.cache/mchose-hub/app.lock.
 
-    window = MainWindow()
-    window.show()
-    return app.exec()
+    QLockFile сам снимает stale-лок от крашнувшегося процесса (в lock-файле
+    записан pid владельца). None — экземпляр уже запущен. Не требует
+    QApplication: вызвать до создания GUI.
+    """
+    lock_path = Path.home() / ".cache" / "mchose-hub" / "app.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock = QLockFile(str(lock_path))
+    if not lock.tryLock(100):
+        return None
+    return lock
+
+
+def main() -> int:
+    """Точка входа GUI: single-instance, QApplication, окно, цикл событий."""
+    lock = try_acquire_single_instance()
+    if lock is None:
+        print("MCHOSE Hub уже запущен")
+        return 0
+    try:
+        app = QApplication(sys.argv)
+        app.setApplicationName(APP_TITLE)
+        app.setOrganizationName("mchose-hub")
+        app.setApplicationVersion("0.2.0")
+        app.setWindowIcon(
+            QIcon(paint_battery_pixmap(100, charging=False, asleep=False))
+        )
+        from .main_window import MainWindow  # локально: избегаем цикла импортов
+
+        window = MainWindow()
+        window.show()
+        return app.exec()
+    finally:
+        lock.unlock()
 
 
 if __name__ == "__main__":

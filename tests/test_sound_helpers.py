@@ -12,6 +12,7 @@ from mchose_hub.gui.helpers import (
     Debounce,
     gain_to_slider,
     is_recoverable_transport,
+    parked_channel_hint,
     preset_for_gains,
     recovery_due,
     slider_to_gain,
@@ -179,3 +180,21 @@ def test_with_transport_retry_passes_other_errors() -> None:
 
     with pytest.raises(TransportError, match="не ответили"):
         with_transport_retry(job, pytest.fail)()  # recover не должен вызываться
+
+
+# --- подсказка про спящий канал (NAK-ступени опроса) ---
+
+
+def test_parked_channel_hint_silent_first_two() -> None:
+    """Первая и вторая NAK подряд — тихий текст (None)."""
+    assert parked_channel_hint(1) is None
+    assert parked_channel_hint(2) is None
+
+
+def test_parked_channel_hint_from_third() -> None:
+    """Третья (и далее) NAK подряд — подсказка про передёргивание донгла."""
+    third = parked_channel_hint(3)
+    assert third is not None
+    assert "Выньте и вставьте донгл" in third
+    assert parked_channel_hint(4) == third
+    assert parked_channel_hint(50) == third

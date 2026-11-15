@@ -12,7 +12,7 @@ import time
 from dataclasses import replace
 
 from . import protocol
-from .transport import HidTransport
+from .transport import HidTransport, TransportError
 
 READ_TIMEOUT_MS = 800
 SETTLE_DELAY_S = 0.05
@@ -44,16 +44,26 @@ class HeadsetService:
 
         Каждая команда наушников обслуживается донглом только после
         UNLOCK командного канала (PROTOCOL.md §7); LOCK выполняется и при
-        ошибке записи/чтения (finally). TransportError записи пробрасывается
-        как прежде — контракт типов возвратов не меняется.
+        ошибке записи/чтения (finally). Наружу всегда уходит исходное
+        исключение записи/чтения: ошибка LOCK на уже отравленном транспорте
+        не информативна (нет подсказки) и глушится; ошибка LOCK при живой
+        записи пробрасывается — она первая и информативная.
         """
         with self._lock:
             self._transport.unlock_command_channel()
+            original: TransportError | None = None
             try:
                 self._transport.write_report(protocol.HEADSET_REPORT_ID, payload)
                 frame = self._transport.read_report(self._read_timeout_ms)
+            except TransportError as exc:
+                original = exc
+                raise
             finally:
-                self._transport.lock_command_channel()
+                try:
+                    self._transport.lock_command_channel()
+                except TransportError:
+                    if original is None:
+                        raise
         if frame is None:
             return None
         return _strip_report_id(frame, protocol.HEADSET_FRAME_SIZE)

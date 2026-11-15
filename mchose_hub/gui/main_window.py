@@ -15,7 +15,6 @@ from PyQt6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QPushButton,
-    QSystemTrayIcon,
     QTabWidget,
     QVBoxLayout,
     QWidget,
@@ -26,7 +25,7 @@ from ..transport import ETIMEDOUT_HEADSET_HINT, UDEV_HINT
 from .app import ManagerSnapshot
 from .dock_tab import DockTab
 from .headset_tab import HeadsetTab
-from .helpers import recovery_due, with_transport_retry
+from .helpers import parked_channel_hint, recovery_due, with_transport_retry
 from .sound_tab import SoundTab
 from .tray import MchoseTray
 from .workers import WorkerHost
@@ -86,6 +85,7 @@ class MainWindow(QMainWindow):
         self._reconnect_generation = 0
         self._shutdown_done = False
         self._last_recovery_discover: float | None = None
+        self._nak_streak = 0
 
         self.setWindowTitle(_WINDOW_TITLE)
         self.resize(760, 560)
@@ -137,12 +137,20 @@ class MainWindow(QMainWindow):
             raise RuntimeError("не удалось создать строку состояния")
         self._status = status
 
-        if QSystemTrayIcon.isSystemTrayAvailable():
-            self._tray = MchoseTray(
+        # Трей создаётся безусловно: на KDE Plasma + Wayland (XWayland-приложение)
+        # isSystemTrayAvailable() ложно сообщает об отсутствии лотка, хотя SNI-
+        # иконки других приложений в нём отображаются (проверено на live).
+        # На системах без лотка иконка не появится — тихая деградация без падения.
+        try:
+            tray = MchoseTray(
                 self,
                 set_mode=self._headset_tab.request_audio_mode,
                 set_shutdown=self._headset_tab.request_shutdown,
             )
+            tray.show()
+            self._tray = tray
+        except Exception:  # noqa: BLE001 — лоток не критичен для работы окна
+            self._tray = None
 
     def _build_device_tab(self, parent: QWidget) -> QWidget:
         widget = QWidget(parent)
@@ -237,8 +245,13 @@ class MainWindow(QMainWindow):
             self._poll_active = False
             battery, mode = result
             if battery is None and mode is None:
-                self.note(_POLL_NO_ANSWER)
+                # Канал не ответил: пара первых NAK — тишина, с третьего
+                # подряд — подсказка про спящий после простоя канал.
+                self._nak_streak += 1
+                hint = parked_channel_hint(self._nak_streak)
+                self.note(hint if hint is not None else _POLL_NO_ANSWER)
                 return
+            self._nak_streak = 0  # любой полученный ответ — канал жив
             if battery is not None:
                 self._headset_tab.apply_battery(battery)
                 if self._tray is not None:

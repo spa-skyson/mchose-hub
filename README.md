@@ -9,7 +9,7 @@ An unofficial Linux control hub for the MCHOSE V9 Turbo+ headset and its RGB doc
 | V9 Turbo+ headset (2.4 GHz dongle) | Battery and charging state; Game 1, Game 2, and Music modes; 15/30/45-minute auto-shutdown; voice-prompt volume; factory reset. |
 | RGB dock | Six lighting effects; on/off; brightness, speed, base colors, Flowing Wave direction, music-reactive mode, sleep settings, and firmware/device information. |
 
-The PyQt6 application provides a window and system tray controls, and displays headset and dock firmware versions. A command-line interface is included for diagnostics and direct control.
+The PyQt6 application provides a window and system tray controls, and displays headset and dock firmware versions. Its **Sound** tab provides a 10-band host-side equalizer (31 Hz–16 kHz, ±12 dB), presets, microphone noise suppression, microphone volume/mute, and microphone monitoring in the headset. A command-line interface is included for diagnostics and direct control.
 
 ## Requirements
 
@@ -73,6 +73,15 @@ Examples:
 python3 -m mchose_hub.cli status
 python3 -m mchose_hub.cli mode music
 python3 -m mchose_hub.cli light info
+python3 -m mchose_hub.cli eq preset Gaming
+python3 -m mchose_hub.cli eq set 6 3
+python3 -m mchose_hub.cli eq status
+python3 -m mchose_hub.cli mic volume 75
+python3 -m mchose_hub.cli mic mute
+python3 -m mchose_hub.cli mic unmute
+python3 -m mchose_hub.cli mic nr on
+python3 -m mchose_hub.cli mic monitor on
+python3 -m mchose_hub.cli mic status
 ```
 
 Example output (values depend on the connected devices):
@@ -102,23 +111,27 @@ Example output (values depend on the connected devices):
   5 — Music Rhythm
 ```
 
-The CLI also supports `shutdown`, `prompt`, and `light on|off|mode|color|brightness|speed|direction`. Run `python3 -m mchose_hub.cli <command> --help` for command-specific arguments.
+The CLI also supports `shutdown`, `prompt`, and `light on|off|mode|color|brightness|speed|direction`. EQ commands are `eq on|off|preset <name>|set <band> <gain>|status`; presets are `Flat`, `Gaming`, `Bass Boost`, `Vocal`, and `Treble Boost`. Microphone commands are `mic volume [0–100]`, `mute`, `unmute`, `nr on|off`, `monitor on|off`, and `status`. Run `python3 -m mchose_hub.cli <command> --help` or `python3 -m mchose_hub.cli <command> <subcommand> --help` for command-specific arguments.
 
 ## Troubleshooting
 
 - **Permission denied opening a HID device:** install `packaging/99-mchose-hub.rules`, run the `udevadm` commands above, then reconnect the device. Check that `/dev/hidraw*` is present and accessible to your user.
 - **The headset does not respond:** confirm that it is powered on and connected over the 2.4 GHz dongle. The headset command channel can park after inactivity; reconnect the dongle physically (unplug and plug it back in). See [PROTOCOL.md §7.1](PROTOCOL.md#71-keepalive-поведение-командного-канала-наушников--эмпирика-2026-11-15).
-- **Looking for EQ settings:** EQ and other audio processing run on the host, not in the headset. Configure them with PipeWire tools such as EasyEffects; those settings stay on the host.
+- **EQ is not audible:** enable EQ and select `effect_input.mchose_eq` as the playback output in the application. `eq on` enables the filter-chain and makes its virtual sink the default; the filter-chain plays through the MCHOSE headset sink.
+- **RNNoise is unavailable:** install the optional `noise-suppression-for-voice` package (AUR on Arch Linux). The application detects whether the RNNoise LADSPA plugin is available.
+- **The microphone does not respond:** make sure the MCHOSE headset microphone is active and available as a PipeWire source.
 
 ## How it works
 
-The HID protocol was reverse-engineered from the official M HUB software. The 2.4 GHz headset dongle uses USB ID `3837:600a`; the RGB dock uses `3837:6008`. Headset commands require opening and closing the command channel with `SET_FEATURE` report `0xAA` (UNLOCK/LOCK). See [PROTOCOL.md](PROTOCOL.md) for the protocol details.
+The HID protocol was reverse-engineered from the official M HUB software. The 2.4 GHz headset dongle uses USB ID `3837:600a`; the RGB dock uses `3837:6008`. Headset commands require opening and closing the command channel with `SET_FEATURE` report `0xAA` (UNLOCK/LOCK). See [PROTOCOL.md](PROTOCOL.md) for the protocol details. EQ and noise suppression are host-side PipeWire filter-chain effects; EQ is exposed as the virtual sink `effect_input.mchose_eq` and routed to the MCHOSE headset sink.
 
 ## Limitations
 
 - Firmware OTA updates are not implemented.
 - There is no Bluetooth transport; headset control uses the 2.4 GHz dongle.
-- EQ and host-side DSP are configured through PipeWire (for example, EasyEffects), not stored in or processed by the headset.
+- EQ and microphone noise-suppression state is stored in `~/.config/mchose-hub/audio.json`; processing runs on the host through PipeWire, not in the headset. EQ uses PipeWire's built-in biquad filters. RNNoise requires the optional `noise-suppression-for-voice` package (AUR on Arch Linux).
+- There is no separate external package requirement for EQ/DSP beyond PipeWire's command-line tools (`pactl`, `wpctl`, `pw-cli`, and `pw-dump`).
+- AUR package templates are provided in [`packaging/AUR/`](packaging/AUR/), for `mchose-hub-git` and the stable `mchose-hub` package. See [`packaging/AUR/README.md`](packaging/AUR/README.md) for publishing instructions.
 
 ## License
 
@@ -140,4 +153,19 @@ python3 -m mchose_hub.gui
 
 Также можно установить правила и пункт меню командой `bash packaging/install.sh`.
 
-Хаб показывает батарею и версии прошивок, переключает режимы Game 1/Game 2/Music, автоотключение и громкость голосовых подсказок. Для дока доступны шесть эффектов подсветки, яркость, скорость, цвета, направление и светомузыка. Отладочный CLI запускается как `python3 -m mchose_hub.cli`; EQ настраивается на хосте через PipeWire/EasyEffects. Протокол и ограничения описаны в [PROTOCOL.md](PROTOCOL.md).
+Хаб показывает батарею и версии прошивок, переключает режимы Game 1/Game 2/Music, автоотключение и громкость голосовых подсказок. Для дока доступны шесть эффектов подсветки, яркость, скорость, цвета, направление и светомузыка. В GUI есть вкладка «Звук»: 10-полосный EQ (31 Hz–16 kHz, ±12 дБ) с пресетами Flat, Gaming, Bass Boost, Vocal, Treble Boost и «Свои», RNNoise-шумоподавление микрофона, его громкость и mute, а также мониторинг в наушниках. EQ и DSP работают на хосте через PipeWire filter-chain; EQ доступен как виртуальный sink `effect_input.mchose_eq` и выводится на sink гарнитуры. CLI-примеры:
+
+```bash
+python3 -m mchose_hub.cli eq preset Gaming
+python3 -m mchose_hub.cli eq set 6 3
+python3 -m mchose_hub.cli eq on
+python3 -m mchose_hub.cli eq status
+python3 -m mchose_hub.cli mic volume 75
+python3 -m mchose_hub.cli mic mute
+python3 -m mchose_hub.cli mic unmute
+python3 -m mchose_hub.cli mic nr on
+python3 -m mchose_hub.cli mic monitor on
+python3 -m mchose_hub.cli mic status
+```
+
+Команды RNNoise требуют опциональный пакет `noise-suppression-for-voice` (AUR в Arch Linux); микрофон MCHOSE должен быть активен. Состояние EQ и шумоподавления хранится в `~/.config/mchose-hub/audio.json`. Шаблоны AUR для `mchose-hub-git` и стабильного `mchose-hub` находятся в [`packaging/AUR/`](packaging/AUR/); инструкция публикации — в [`packaging/AUR/README.md`](packaging/AUR/README.md). После отравления транспорта или EOF GUI пере-сканирует устройства на следующем тике опроса и повторяет команду автоматически. Протокол устройства описан в [PROTOCOL.md](PROTOCOL.md).

@@ -213,6 +213,52 @@ def test_session_locks_on_transport_error(fake_transport: FakeTransport) -> None
     assert fake_transport.events == ["unlock", "write", "lock"]
 
 
+def test_query_keeps_original_error_over_lock_error(
+    fake_transport: FakeTransport,
+) -> None:
+    """Ошибка LOCK на отравленном транспорте не вытесняет исходную с подсказкой."""
+
+    def poisoned_write(report_id: int, payload: bytes) -> int:
+        fake_transport.events.append("write")
+        raise TransportError(
+            "ошибка записи: канал управления спит после простоя",
+            "включите звук через наушники, затем передёрните донгл",
+        )
+
+    def poisoned_lock() -> None:
+        fake_transport.events.append("lock")
+        raise TransportError("транспорт отравлен незавершённой записью")
+
+    fake_transport.write_report = poisoned_write  # type: ignore[method-assign]
+    fake_transport.lock_command_channel = poisoned_lock  # type: ignore[method-assign]
+    service = HeadsetService(fake_transport, settle_delay_s=0.0)
+    with pytest.raises(TransportError) as excinfo:
+        service.poll_battery()
+    assert "спит после простоя" in excinfo.value.message
+    assert "передёрните донгл" in excinfo.value.hint
+    assert "отравлен" not in excinfo.value.message
+    assert fake_transport.events == ["unlock", "write", "lock"]
+
+
+def test_query_propagates_lock_error_when_write_ok(
+    fake_transport: FakeTransport,
+) -> None:
+    """Запись успешна, LOCK не прошёл: наружу именно ошибка LOCK."""
+
+    def failing_lock() -> None:
+        fake_transport.events.append("lock")
+        raise TransportError("LOCK не принят донглом")
+
+    fake_transport.lock_command_channel = failing_lock  # type: ignore[method-assign]
+    fake_transport.queue_response(
+        headset_frame(proto.HEADSET_REPORT_ID, 0x65, 66, proto.BATTERY_STATUS_DISCHARGE)
+    )
+    service = HeadsetService(fake_transport, settle_delay_s=0.0)
+    with pytest.raises(TransportError, match="LOCK не принят"):
+        service.poll_battery()
+    assert fake_transport.events == ["unlock", "write", "read", "lock"]
+
+
 def test_set_audio_mode_session_order(fake_transport: FakeTransport) -> None:
     """set_audio_mode: одна сессия на write + settle + query + read."""
     fake_transport.queue_response(

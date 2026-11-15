@@ -225,3 +225,22 @@ def with_transport_retry(
             return job()
 
     return wrapped
+
+
+# --- опрос устройства: подсказка про спящий командный канал ---
+
+# Донгл паркует командный канал после простоя (PROTOCOL.md §7.1): пара
+# первых NAK — обычная тишина, с третьего подряд канал считается спящим.
+PARKED_CHANNEL_THRESHOLD = 3
+
+PARKED_CHANNEL_HINT = (
+    "Канал управления спит после простоя. Выньте и вставьте донгл, "
+    "пока наушники включены и играют звук — приложение подхватит автоматически."
+)
+
+
+def parked_channel_hint(streak: int) -> str | None:
+    """Подсказка после streak неответов опроса подряд; None — тихий текст."""
+    if streak >= PARKED_CHANNEL_THRESHOLD:
+        return PARKED_CHANNEL_HINT
+    return None
